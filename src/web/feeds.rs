@@ -61,6 +61,14 @@ pub fn upstream_json(response: &SearchResponse) -> serde_json::Value {
             if let Some(family) = &result.source_family {
                 object["source_family"] = serde_json::json!(family);
             }
+            // The status explains a missing or degraded body, so it is
+            // reported even when `raw_content` is absent.
+            if let Some(status) = &result.raw_content_status {
+                object["raw_content_status"] = serde_json::json!(status);
+            }
+            if let Some(error) = &result.raw_content_error {
+                object["raw_content_error"] = serde_json::json!(error);
+            }
             object
         })
         .collect();
@@ -298,6 +306,51 @@ mod tests {
                 .get("raw_content_truncated")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn both_json_forms_report_raw_content_status_and_error() {
+        let query =
+            crate::query::Query::parse("test", &crate::engine::EngineRegistry::default(), &[]);
+        let mut response = crate::aggregator::SearchResponse::new(&query);
+        let mut failed = crate::results::SearchResult::new("https://example.org/a", "failed");
+        failed.raw_content_status = Some("fetch_failed".into());
+        failed.raw_content_error = Some("connection refused".into());
+        let mut skipped = crate::results::SearchResult::new("https://example.org/b", "skipped");
+        skipped.raw_content_status = Some("not_requested".into());
+        let mut read = crate::results::SearchResult::new("https://example.org/c", "read");
+        read.raw_content = Some("page text".into());
+        read.raw_content_status = Some("ok".into());
+        response.results.extend([failed, skipped, read]);
+        for value in [upstream_json(&response), json_response_full(&response)] {
+            let results = &value["results"];
+            // A result without a body still says why.
+            assert!(results[0].get("raw_content").is_none());
+            assert_eq!(results[0]["raw_content_status"], "fetch_failed");
+            assert_eq!(results[0]["raw_content_error"], "connection refused");
+            assert_eq!(results[1]["raw_content_status"], "not_requested");
+            assert!(results[1].get("raw_content_error").is_none());
+            assert_eq!(results[2]["raw_content"], "page text");
+            assert_eq!(results[2]["raw_content_status"], "ok");
+            assert!(results[2].get("raw_content_error").is_none());
+        }
+    }
+
+    #[test]
+    fn json_without_raw_content_request_has_no_status_fields() {
+        let query =
+            crate::query::Query::parse("test", &crate::engine::EngineRegistry::default(), &[]);
+        let mut response = crate::aggregator::SearchResponse::new(&query);
+        response.results.push(crate::results::SearchResult::new(
+            "https://example.org/",
+            "plain",
+        ));
+        for value in [upstream_json(&response), json_response_full(&response)] {
+            let result = value["results"][0].as_object().unwrap();
+            assert!(!result.contains_key("raw_content"));
+            assert!(!result.contains_key("raw_content_status"));
+            assert!(!result.contains_key("raw_content_error"));
+        }
     }
 
     #[test]
