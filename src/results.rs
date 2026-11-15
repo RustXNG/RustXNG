@@ -708,23 +708,21 @@ fn distill_transfers(results: &mut Vec<SearchResult>, _query_terms: &[String]) {
             if title_dice(&ex_norm, &cand_norm) < 0.95 {
                 continue;
             }
+            if existing.score < candidate.score {
+                std::mem::swap(existing, &mut candidate);
+            }
             // 転載として統合する。代表（existing）に寄せる。
             let merged_label = format!("{} | {}", candidate.title, candidate.url);
             existing.merged_sources.push(merged_label);
+            existing
+                .merged_sources
+                .append(&mut candidate.merged_sources);
             for engine in candidate.engines.drain(..) {
                 if !existing.engines.contains(&engine) {
                     existing.engines.push(engine);
                 }
             }
             existing.positions.append(&mut candidate.positions);
-            if existing.score < candidate.score {
-                // より強い結果を代表にする
-                std::mem::swap(&mut existing.url, &mut candidate.url);
-                std::mem::swap(&mut existing.title, &mut candidate.title);
-                std::mem::swap(&mut existing.content, &mut candidate.content);
-                std::mem::swap(&mut existing.score, &mut candidate.score);
-                std::mem::swap(&mut existing.relevance_score, &mut candidate.relevance_score);
-            }
             continue 'outer;
         }
         keep.push(candidate);
@@ -2215,9 +2213,69 @@ mod tests {
         ];
         distill_transfers(&mut results, &["php".to_string()]);
         assert_eq!(results.len(), 1, "転載を統合する");
+        assert_eq!(results[0].url, "https://jvn.jp/a");
         assert_eq!(results[0].merged_sources.len(), 1, "統合元を記録する");
         assert!(results[0].engines.contains(&"jvn_vu".to_string()));
         assert!(results[0].engines.contains(&"bing_web".to_string()));
+    }
+
+    #[test]
+    fn transfer_representative_keeps_its_metadata() {
+        let original = SearchResult {
+            content: "Original summary".into(),
+            score: 2.0,
+            category: "news".into(),
+            template: Template::Videos,
+            published_date: Some("2026-11-15T00:00:00Z".into()),
+            author: Some("Original author".into()),
+            thumbnail: Some("https://origin.example/thumbnail.jpg".into()),
+            metadata: BTreeMap::from([("length".into(), "60".into())]),
+            source_family: Some("original".into()),
+            relevance_score: Some(0.8),
+            ..sr("Release 1.2", "https://origin.example/release", "origin")
+        };
+        let mirror = sr("release 1.2!", "https://mirror.example/release", "mirror");
+        for original_first in [false, true] {
+            let mut results = vec![mirror.clone(), original.clone()];
+            if original_first {
+                results.reverse();
+            }
+            distill_transfers(&mut results, &[]);
+
+            let mut expected = original.clone();
+            expected.engines.push(mirror.engine.clone());
+            expected.positions.push(1);
+            expected
+                .merged_sources
+                .push(format!("{} | {}", mirror.title, mirror.url));
+            assert_eq!(
+                serde_json::to_value(&results).unwrap(),
+                serde_json::to_value([expected]).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_promotions_preserve_all_sources() {
+        let mut results = vec![
+            sr("Release", "https://a.example/release", "a"),
+            sr("Release", "https://b.example/release", "b"),
+            sr("Release", "https://c.example/release", "c"),
+        ];
+        for (index, result) in results.iter_mut().enumerate() {
+            result.score = (index + 1) as f64;
+        }
+        distill_transfers(&mut results, &[]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://c.example/release");
+        results[0].merged_sources.sort();
+        assert_eq!(
+            results[0].merged_sources,
+            [
+                "Release | https://a.example/release",
+                "Release | https://b.example/release"
+            ]
+        );
     }
 
     #[test]
