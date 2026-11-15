@@ -127,6 +127,18 @@ pub struct SearchResult {
     /// Short reader message behind `raw_content_status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_content_error: Option<String>,
+    /// 転載統合（distillation）でこの結果にまとめた転載元のタイトルと URL。
+    ///
+    /// SearXNG には無い上流超えの蒸留: 同じ原発表の転載（ベンダー公告 → 記事 → ミラー）を
+    /// 1 件に統合し、独立した根拠を数え誤らせないようにする（D47）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_sources: Vec<String>,
+    /// 出典系列（転載チェーンの記録）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_family: Option<String>,
+    /// 検索クエリとの関連性（0.0〜1.0）。蒸留の可視化と、転載統合時の代表選択に使う。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relevance_score: Option<f64>,
     /// Whether the result belongs to the group of the previous one (UI only).
     #[serde(skip)]
     pub open_group: bool,
@@ -450,9 +462,9 @@ impl ResultContainer {
             // Blend in how well the URL + title cover the query terms. Position
             // fusion alone ranks a homepage above the page that actually answers
             // the query; this lifts the latter the way a neural ranker does.
-            result.score = score
-                + relevance_weight
-                    * relevance(&result.url, &result.title, &result.content, query_terms);
+            let rel = relevance(&result.url, &result.title, &result.content, query_terms);
+            result.relevance_score = Some(rel);
+            result.score = score + relevance_weight * rel;
             // Naming a site in the query means "that site's own page": lift the
             // canonical host and push mirrors down. This is the part keyword
             // and embedding ranking cannot see (official docs vs its mirror).
@@ -480,6 +492,12 @@ impl ResultContainer {
                 result.score += relevance_weight * language;
             }
         }
+
+        // --- 蒸留（上流超え）: 転載の統合 ---
+        // 同じ原発表の転載（ベンダー公告 → 記事 → ミラー）が別ドメインで重複する。
+        // これを 1 件に統合しないと「独立した根拠の数」を数え誤る（D47）。
+        // 統合は保守的: タイトルの正規化一致、数字列の完全一致、Dice >= 0.95 のすべてを満たす場合のみ。
+        distill_transfers(&mut self.main, query_terms);
 
         self.ordered = order_results(&self.main);
     }
@@ -601,6 +619,119 @@ fn merge_infobox(origin: &mut Infobox, other: &Infobox) {
 }
 
 /// Group-by-category ordering, ported from `ResultContainer.get_ordered_results`.
+/// URL からホストだけを抜く（転載は別ドメインの再掲のみを指す）。
+fn url_host(url: &str) -> &str {
+    url.split(['/', ':']).nth(3).unwrap_or("")
+}
+
+/// タイトルを正規化する（転載判定用）。
+///
+/// NFKC 相当の大文字小文字・記号・空白の揺れを吸収する。ただし数字列は残す
+/// （版番号・CVE 番号の違いは別の記事の目印なので）。
+fn normalize_title_for_dedup(title: &str) -> String {
+    // 空白・記号を除去して比較する。日本語は空白で区切らないので、
+    // 空白を残すと「PHP の脆弱性」と「PHPの脆弱性」が別物になってしまう。
+    let mut out = String::with_capacity(title.len());
+    for ch in title.chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+        }
+    }
+    out
+}
+
+/// タイトルから数字列だけを抜く（版番号・CVE 番号の照合用）。
+fn title_numbers(title: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for ch in title.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// 語の Dice 係数（正規化済みタイトルの類似度）。
+fn title_dice(a: &str, b: &str) -> f64 {
+    let words_a: std::collections::BTreeSet<&str> = a.split_whitespace().collect();
+    let words_b: std::collections::BTreeSet<&str> = b.split_whitespace().collect();
+    if words_a.is_empty() && words_b.is_empty() {
+        return 1.0;
+    }
+    let overlap = words_a.intersection(&words_b).count();
+    2.0 * overlap as f64 / (words_a.len() + words_b.len()) as f64
+}
+
+/// 転載の統合（distillation）。
+///
+/// 統合条件はすべてを満たす場合のみ（誤統合は根拠を失わせるので最悪）:
+///  1. 正規化タイトルの完全一致
+///  2. 数字列の完全一致（版番号・CVE 番号の違いは別の記事）
+///  3. Dice >= 0.95（語集合の類似）
+///
+/// 統合時はスコアの高い方を代表とし、engines / positions / merged_sources を寄せる。
+fn distill_transfers(results: &mut Vec<SearchResult>, _query_terms: &[String]) {
+    if results.len() < 2 {
+        return;
+    }
+    let mut keep: Vec<SearchResult> = Vec::with_capacity(results.len());
+    'outer: for mut candidate in results.drain(..) {
+        let cand_norm = normalize_title_for_dedup(&candidate.title);
+        // タイトルが空の結果同士は転載判定できない（空文字同士が全件一致してしまう）。
+        // 統合せず、そのまま残す。
+        if cand_norm.is_empty() {
+            keep.push(candidate);
+            continue 'outer;
+        }
+        let cand_nums = title_numbers(&candidate.title);
+        for existing in keep.iter_mut() {
+            // 転載は「別ドメインでの再掲」。同じホストの別ページ（例: サイト内の一覧と詳細）は
+            // タイトルが似ていても別のページなので統合しない。
+            if url_host(&existing.url) == url_host(&candidate.url) {
+                continue;
+            }
+            let ex_norm = normalize_title_for_dedup(&existing.title);
+            if ex_norm != cand_norm {
+                continue;
+            }
+            if title_numbers(&existing.title) != cand_nums {
+                continue; // 数字が違う = 別の記事（版番号・CVE 番号が違う）
+            }
+            if title_dice(&ex_norm, &cand_norm) < 0.95 {
+                continue;
+            }
+            // 転載として統合する。代表（existing）に寄せる。
+            let merged_label = format!("{} | {}", candidate.title, candidate.url);
+            existing.merged_sources.push(merged_label);
+            for engine in candidate.engines.drain(..) {
+                if !existing.engines.contains(&engine) {
+                    existing.engines.push(engine);
+                }
+            }
+            existing.positions.append(&mut candidate.positions);
+            if existing.score < candidate.score {
+                // より強い結果を代表にする
+                std::mem::swap(&mut existing.url, &mut candidate.url);
+                std::mem::swap(&mut existing.title, &mut candidate.title);
+                std::mem::swap(&mut existing.content, &mut candidate.content);
+                std::mem::swap(&mut existing.score, &mut candidate.score);
+                std::mem::swap(&mut existing.relevance_score, &mut candidate.relevance_score);
+            }
+            continue 'outer;
+        }
+        keep.push(candidate);
+    }
+    *results = keep;
+}
+
 fn order_results(results: &[SearchResult]) -> Vec<SearchResult> {
     let mut sorted: Vec<SearchResult> = results.to_vec();
     sorted.sort_by(|a, b| {
@@ -2058,4 +2189,70 @@ mod tests {
         let rich = serde_json::to_value(&result).expect("json");
         assert_eq!(rich["raw_content"], "page text");
     }
+    // -------------------------------------------------------------------------
+    // 転載統合（distillation）: 上流超えの蒸留
+    // -------------------------------------------------------------------------
+
+    fn sr(title: &str, url: &str, engine: &str) -> SearchResult {
+        SearchResult {
+            url: url.to_string(),
+            title: title.to_string(),
+            content: String::new(),
+            engine: engine.to_string(),
+            engines: vec![engine.to_string()],
+            positions: vec![1],
+            score: 1.0,
+            ..SearchResult::default()
+        }
+    }
+
+    #[test]
+    fn transfer_of_the_same_article_is_merged() {
+        // 同じ記事の転載（全角半角・空白の揺れ）は 1 件に統合する
+        let mut results = vec![
+            sr("PHP の脆弱性対策について", "https://jvn.jp/a", "jvn_vu"),
+            sr("PHPの脆弱性対策について", "https://mirror.example/b", "bing_web"),
+        ];
+        distill_transfers(&mut results, &["php".to_string()]);
+        assert_eq!(results.len(), 1, "転載を統合する");
+        assert_eq!(results[0].merged_sources.len(), 1, "統合元を記録する");
+        assert!(results[0].engines.contains(&"jvn_vu".to_string()));
+        assert!(results[0].engines.contains(&"bing_web".to_string()));
+    }
+
+    #[test]
+    fn different_version_numbers_are_kept_separate() {
+        // 数字（版番号）が違う記事は別の記事。統合してはいけない（根拠を失わせる）
+        let mut results = vec![
+            sr("PHP 8.0.33 の更新", "https://a.example/1", "jvn_vu"),
+            sr("PHP 8.0.31 の更新", "https://b.example/2", "bing_web"),
+        ];
+        distill_transfers(&mut results, &["php".to_string()]);
+        assert_eq!(results.len(), 2, "版番号が違えば統合しない");
+    }
+
+    #[test]
+    fn unrelated_articles_are_kept_separate() {
+        let mut results = vec![
+            sr("Apache の脆弱性", "https://a.example/1", "jvn_vu"),
+            sr("nginx の設定ミス", "https://b.example/2", "bing_web"),
+        ];
+        distill_transfers(&mut results, &[]);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn normalize_title_for_dedup_folds_case_and_punctuation() {
+        assert_eq!(
+            normalize_title_for_dedup("PHP の脆弱性対策について！"),
+            normalize_title_for_dedup("phpの脆弱性対策について"),
+        );
+    }
+
+    #[test]
+    fn title_numbers_detects_version_differences() {
+        assert_eq!(title_numbers("PHP 8.0.33"), vec!["8".to_string(), "0".to_string(), "33".to_string()]);
+        assert_ne!(title_numbers("PHP 8.0.33"), title_numbers("PHP 8.0.31"));
+    }
+
 }
