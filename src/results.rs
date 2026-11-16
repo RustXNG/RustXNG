@@ -723,7 +723,10 @@ fn distill_transfers(results: &mut Vec<SearchResult>, _query_terms: &[String]) {
                 std::mem::swap(&mut existing.title, &mut candidate.title);
                 std::mem::swap(&mut existing.content, &mut candidate.content);
                 std::mem::swap(&mut existing.score, &mut candidate.score);
-                std::mem::swap(&mut existing.relevance_score, &mut candidate.relevance_score);
+                std::mem::swap(
+                    &mut existing.relevance_score,
+                    &mut candidate.relevance_score,
+                );
             }
             continue 'outer;
         }
@@ -2211,7 +2214,11 @@ mod tests {
         // 同じ記事の転載（全角半角・空白の揺れ）は 1 件に統合する
         let mut results = vec![
             sr("PHP の脆弱性対策について", "https://jvn.jp/a", "jvn_vu"),
-            sr("PHPの脆弱性対策について", "https://mirror.example/b", "bing_web"),
+            sr(
+                "PHPの脆弱性対策について",
+                "https://mirror.example/b",
+                "bing_web",
+            ),
         ];
         distill_transfers(&mut results, &["php".to_string()]);
         assert_eq!(results.len(), 1, "転載を統合する");
@@ -2251,8 +2258,10 @@ mod tests {
 
     #[test]
     fn title_numbers_detects_version_differences() {
-        assert_eq!(title_numbers("PHP 8.0.33"), vec!["8".to_string(), "0".to_string(), "33".to_string()]);
+        assert_eq!(
+            title_numbers("PHP 8.0.33"),
+            vec!["8".to_string(), "0".to_string(), "33".to_string()]
+        );
         assert_ne!(title_numbers("PHP 8.0.33"), title_numbers("PHP 8.0.31"));
     }
-
 }
