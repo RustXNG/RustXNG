@@ -137,6 +137,8 @@ using_tor_proxy = false
 # Response cache.
 # backend = "memory" keeps entries inside the process; backend = "valkey"
 # stores them in Valkey / Redis so several instances share one cache.
+# 未知の backend、redis:// / valkey:// 以外の url、0 の ttl は起動時（--check-config でも）
+# エラーになります。
 [cache]
 backend = "memory"
 url = "redis://127.0.0.1:6379/0"
@@ -156,6 +158,11 @@ model = "gpt-4o-mini"
 max_queries = 5
 max_sources = 10
 timeout = 60
+# /research 全体の期限（秒）。サブクエリと本文取得は逐次実行されるため、
+# LLM の timeout だけでは上限にならない。
+deadline = 120
+# 同時に処理する /research の数。超過分は 429 で断る。
+max_concurrency = 2
 
 # MCP の read_page と HTTP の include_raw_content が使う本文取得。
 # provider = "direct" は宛先をローカルで検証する従来の取得を使う。

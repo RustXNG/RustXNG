@@ -17,6 +17,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::locales;
 
+/// Largest page number the HTTP API accepts.
+///
+/// `search.max_page = 0` means "no configured limit", but every engine
+/// multiplies the page number into an offset, so the entry point clamps to
+/// this value. Kept here so diagnostics and the web layer share one number.
+pub const MAX_PAGENO: u32 = 1000;
+
 /// The built-in defaults, embedded at compile time.
 pub const DEFAULT_SETTINGS: &str = include_str!("../settings.toml");
 
@@ -83,6 +90,13 @@ pub struct ResearchSettings {
     pub max_sources: usize,
     /// LLM request timeout in seconds.
     pub timeout: u64,
+    /// Whole-request deadline of `/research`, in seconds.
+    ///
+    /// Sub-queries and page fetches run one after another, so the LLM timeout
+    /// alone does not bound the endpoint.
+    pub deadline: u64,
+    /// How many `/research` requests may run at the same time.
+    pub max_concurrency: usize,
 }
 
 impl Default for ResearchSettings {
@@ -95,6 +109,8 @@ impl Default for ResearchSettings {
             max_queries: 5,
             max_sources: 10,
             timeout: 60,
+            deadline: 120,
+            max_concurrency: 2,
         }
     }
 }
@@ -1074,6 +1090,9 @@ impl Settings {
                 )));
             }
         }
+        self.validate_cache()?;
+        self.validate_research()?;
+        self.validate_base_url()?;
         let mut names: BTreeMap<&str, &str> = BTreeMap::new();
         let mut shortcuts: BTreeMap<&str, &str> = BTreeMap::new();
         for engine in &self.engines {
@@ -1104,6 +1123,118 @@ impl Settings {
             }
         }
         Ok(())
+    }
+
+    /// The cache backend is selected by name and must be usable as configured.
+    fn validate_cache(&self) -> Result<(), SettingsError> {
+        let backend = self.cache.backend.trim().to_ascii_lowercase();
+        match backend.as_str() {
+            "memory" => {
+                if self.cache.max_bytes == 0 {
+                    return Err(SettingsError::Validation(
+                        "cache.max_bytes must be greater than 0".into(),
+                    ));
+                }
+            }
+            "valkey" => {
+                if self.cache.ttl == 0 {
+                    return Err(SettingsError::Validation(
+                        "cache.ttl must be greater than 0 for the valkey backend".into(),
+                    ));
+                }
+                let url = self.cache.url.trim();
+                if !(url.starts_with("redis://") || url.starts_with("valkey://")) {
+                    return Err(SettingsError::Validation(format!(
+                        "cache.url must start with redis:// or valkey://, got {url:?}"
+                    )));
+                }
+            }
+            other => {
+                return Err(SettingsError::Validation(format!(
+                    "cache.backend must be memory or valkey, got {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `/research` needs positive limits; zero would silently be clamped.
+    fn validate_research(&self) -> Result<(), SettingsError> {
+        for (name, value) in [
+            ("research.max_queries", self.research.max_queries),
+            ("research.max_sources", self.research.max_sources),
+            ("research.max_concurrency", self.research.max_concurrency),
+        ] {
+            if value == 0 {
+                return Err(SettingsError::Validation(format!(
+                    "{name} must be greater than 0"
+                )));
+            }
+        }
+        if self.research.deadline == 0 {
+            return Err(SettingsError::Validation(
+                "research.deadline must be greater than 0".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `server.base_url` feeds feeds and the OpenSearch description, so a
+    /// value that is not an absolute http(s) URL would produce broken links.
+    fn validate_base_url(&self) -> Result<(), SettingsError> {
+        let Some(base) = self
+            .server
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+        let parsed = url::Url::parse(base).map_err(|error| {
+            SettingsError::Validation(format!("server.base_url is not a URL: {error}"))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(SettingsError::Validation(format!(
+                "server.base_url must be an absolute http(s) URL, got {base:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Valid settings that are still likely to surprise an operator.
+    ///
+    /// `--check-config` prints these next to the readiness report and the
+    /// server logs them once at startup. They are not errors: the instance
+    /// runs, but the behaviour may differ from what was intended.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.search.max_page == 0 {
+            warnings.push(format!(
+                "search.max_page = 0 (no configured limit): the HTTP API still rejects page numbers above {MAX_PAGENO}"
+            ));
+        }
+        let loopback = matches!(
+            self.server.bind_address.as_str(),
+            "127.0.0.1" | "localhost" | "::1"
+        );
+        if !loopback && !self.server.limiter.is_enabled() {
+            warnings.push(
+                "server.bind_address is not loopback while server.limiter is disabled".to_string(),
+            );
+        }
+        if !self.general.enable_metrics {
+            warnings.push(
+                "general.enable_metrics = false: /metrics answers 404".to_string(),
+            );
+        }
+        if self.research.enabled && self.research.api_key.trim().is_empty() {
+            warnings.push(
+                "research.enabled = true without research.api_key: /research returns evidence only"
+                    .to_string(),
+            );
+        }
+        warnings
     }
 
     /// Engines that are enabled by default, in config order.
@@ -1835,6 +1966,83 @@ engines:
             aliases.push_str(&format!("a{level}: &a{level} [{repeated}]\n"));
         }
         assert!(Settings::user_value(&aliases, true).is_err());
+    }
+
+    #[test]
+    fn the_cache_backend_must_be_usable_as_configured() {
+        let mut settings = Settings::defaults();
+        settings.cache.backend = "redis".into();
+        assert!(settings.validate().is_err(), "unknown backend");
+        settings.cache.backend = "valkey".into();
+        settings.cache.url = "http://127.0.0.1:6379".into();
+        assert!(settings.validate().is_err(), "valkey needs a redis URL");
+        settings.cache.url = "redis://127.0.0.1:6379/0".into();
+        settings.validate().expect("a redis URL is accepted");
+        settings.cache.ttl = 0;
+        assert!(settings.validate().is_err(), "ttl must be positive");
+        settings.cache.ttl = 300;
+        settings.cache.backend = "memory".into();
+        settings.cache.max_bytes = 0;
+        assert!(settings.validate().is_err(), "memory needs a size budget");
+    }
+
+    #[test]
+    fn warnings_explain_valid_but_surprising_settings() {
+        let mut settings = Settings::defaults();
+        settings.search.max_page = 20;
+        settings.server.bind_address = "127.0.0.1".into();
+        settings.server.limiter = LimiterSettings::Enabled(false);
+        settings.general.enable_metrics = true;
+        settings.research.enabled = false;
+        assert!(settings.warnings().is_empty(), "{:?}", settings.warnings());
+
+        settings.search.max_page = 0;
+        assert!(
+            settings.warnings().iter().any(|warning| warning.contains("max_page")),
+            "the page cap is explained"
+        );
+
+        settings.search.max_page = 20;
+        settings.server.bind_address = "0.0.0.0".into();
+        assert!(
+            settings.warnings().iter().any(|warning| warning.contains("limiter")),
+            "a public bind without the limiter is called out"
+        );
+
+        settings.server.bind_address = "127.0.0.1".into();
+        settings.research.enabled = true;
+        assert!(
+            settings.warnings().iter().any(|warning| warning.contains("api_key")),
+            "research without a key is called out"
+        );
+    }
+
+    #[test]
+    fn research_limits_must_be_positive() {
+        let mut settings = Settings::defaults();
+        settings.research.deadline = 0;
+        assert!(settings.validate().is_err());
+        settings.research.deadline = 120;
+        settings.research.max_concurrency = 0;
+        assert!(settings.validate().is_err());
+        settings.research.max_concurrency = 2;
+        settings.research.max_queries = 0;
+        assert!(settings.validate().is_err());
+        settings.research.max_queries = 5;
+        settings.validate().expect("the defaults are valid");
+    }
+
+    #[test]
+    fn a_relative_or_non_http_base_url_is_rejected() {
+        let mut settings = Settings::defaults();
+        settings.server.base_url = Some("/search".into());
+        assert!(settings.validate().is_err(), "relative URL");
+        settings.server.base_url = Some("ftp://example.com/".into());
+        assert!(settings.validate().is_err(), "non-http scheme");
+        settings.server.base_url = Some("https://search.example/".into());
+        settings.validate().expect("absolute https URL");
+        settings.server.base_url = Some(String::new());
+        settings.validate().expect("an empty value falls back to the listener");
     }
 
     #[test]

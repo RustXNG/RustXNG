@@ -28,6 +28,8 @@ OPTIONS:
                            (default: $SEARXNG_SETTINGS_PATH)
     -b, --bind <ADDRESS>   Address to listen on (default: server.bind_address)
     -p, --port <PORT>      Port to listen on (default: server.port)
+    --check-config        Validate the settings, build the engines and print
+                          whether this instance can search (no socket is opened)
     --check-update        Check the latest official release
     --update              Download, verify and install the latest release
     -v, --version          Print the version
@@ -40,6 +42,7 @@ ENVIRONMENT:
 
 struct Args {
     mcp: bool,
+    check_config: bool,
     config: Option<PathBuf>,
     profile: Option<Profile>,
     bind: Option<String>,
@@ -50,6 +53,7 @@ struct Args {
 fn parse_args() -> Result<Option<Args>, String> {
     let mut args = Args {
         mcp: false,
+        check_config: false,
         config: None,
         profile: None,
         bind: None,
@@ -67,6 +71,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 print!("{HELP}");
                 return Ok(None);
             }
+            "--check-config" => args.check_config = true,
             "-v" | "--version" => {
                 println!("{}", version_string());
                 return Ok(None);
@@ -126,6 +131,10 @@ async fn main() -> ExitCode {
         eprintln!("error: mcp only accepts --profile and --config");
         return ExitCode::from(2);
     }
+    if args.check_config && args.mcp {
+        eprintln!("error: --check-config cannot be combined with mcp");
+        return ExitCode::from(2);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -176,6 +185,7 @@ async fn main() -> ExitCode {
         }
     };
 
+    let warnings = settings.warnings();
     let searcher = match Searcher::new(settings) {
         Ok(searcher) => searcher,
         Err(error) => {
@@ -183,6 +193,22 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    for warning in &warnings {
+        tracing::warn!("{}", warning);
+    }
+    if args.check_config {
+        let readiness = rustxng::diagnostics::Readiness::evaluate(&searcher.settings, searcher.registry.len());
+        let report = serde_json::json!({
+            "profile": profile.name(),
+            "ready": readiness.ready,
+            "engines": readiness.engines,
+            "local_index": readiness.local_index,
+            "reasons": readiness.reasons,
+            "warnings": warnings,
+        });
+        println!("{report}");
+        return ExitCode::SUCCESS;
+    }
     print_profile_notice(profile);
     if args.mcp {
         return match rustxng::mcp::serve_stdio(searcher).await {
@@ -304,8 +330,32 @@ async fn shutdown_reason(activity: std::sync::Arc<AtomicU64>, idle_seconds: u64)
     }
 }
 
+/// Resolve on SIGINT (Ctrl-C) or, on Unix, SIGTERM.
+///
+/// Containers and service managers send SIGTERM: without watching it, `docker
+/// stop` or `systemctl stop` would kill the process after the grace period
+/// instead of letting in-flight requests finish.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot watch SIGTERM, only Ctrl-C is handled");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
     tracing::info!("shutting down");
 }
 

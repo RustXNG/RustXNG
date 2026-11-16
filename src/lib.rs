@@ -30,6 +30,7 @@ pub mod categories;
 pub mod content;
 pub mod crawl;
 pub mod deep_research;
+pub mod diagnostics;
 pub mod engine;
 pub mod engines;
 pub mod external_bangs;
