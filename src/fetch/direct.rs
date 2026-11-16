@@ -17,7 +17,7 @@
 //! fetched without these checks. Extracted text is kept per session instead,
 //! so reading a page slice by slice fetches it once.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -174,6 +174,44 @@ impl Resolve for PublicResolver {
             }
             Ok(Box::new(addresses.into_iter()) as Addrs)
         })
+    }
+}
+
+/// The validating resolver, with the operator-configured engine hosts allowed
+/// to answer with any address.
+///
+/// A search engine endpoint is trusted configuration: an operator may point it
+/// at a service on their own network, so those names are exempt from the
+/// global-address rule. Every other name, including a redirect target, is
+/// still resolved once and rejected when any answer is non-global.
+pub(crate) fn validated_resolver(allow: Vec<String>) -> Arc<dyn Resolve> {
+    let allow: BTreeSet<String> = allow
+        .iter()
+        .map(|name| name.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    Arc::new(AllowedResolver {
+        inner: Arc::new(PublicResolver(Arc::new(SystemResolver))),
+        allow,
+    })
+}
+
+/// Whether a configured engine endpoint owns this name.
+pub(crate) fn is_configured_engine_name(allow: &BTreeSet<String>, name: &str) -> bool {
+    allow.contains(&name.trim().trim_end_matches('.').to_ascii_lowercase())
+}
+
+struct AllowedResolver {
+    inner: Arc<dyn Resolve>,
+    allow: BTreeSet<String>,
+}
+
+impl Resolve for AllowedResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        if is_configured_engine_name(&self.allow, name.as_str()) {
+            return Arc::new(SystemResolver).resolve(name);
+        }
+        self.inner.resolve(name)
     }
 }
 
@@ -718,6 +756,23 @@ mod tests {
             http.remembered("https://example.org/", 100, &language)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn only_configured_engine_names_are_exempt_from_the_global_rule() {
+        let allow: BTreeSet<String> = ["engine.internal", "Example.COM."]
+            .into_iter()
+            .map(|name| name.trim().trim_end_matches('.').to_ascii_lowercase())
+            .collect();
+        assert!(is_configured_engine_name(&allow, "engine.internal"));
+        assert!(is_configured_engine_name(&allow, "EXAMPLE.com"));
+        assert!(is_configured_engine_name(&allow, "Example.COM."));
+        assert!(!is_configured_engine_name(&allow, "evil.internal"));
+        assert!(!is_configured_engine_name(&allow, "127.0.0.1.nip.io"));
+        assert!(!is_configured_engine_name(
+            &BTreeSet::new(),
+            "engine.internal"
+        ));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use reqwest::dns::Resolve;
 use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 use tracing::debug;
@@ -101,6 +102,77 @@ pub struct Network {
     host_slots: std::sync::Mutex<std::collections::HashMap<String, tokio::time::Instant>>,
     /// Concurrent media reads (`fetch_image`).
     media_slots: Arc<tokio::sync::Semaphore>,
+    /// Resolver shared by the engine clients: one lookup, and an answer that
+    /// contains a non-global address is refused unless the name is a
+    /// configured engine endpoint.
+    resolver: Arc<dyn Resolve>,
+}
+
+/// Decoded body bytes accepted from one engine response.
+///
+/// An engine answer is parsed whole, so an unbounded body is operator-visible
+/// memory: one hostile or compromised upstream could inflate the process by
+/// the size of its reply. 8 MiB is far above any real search answer.
+const ENGINE_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Whether an engine redirect may follow from `previous` to `target`.
+///
+/// Staying on the same host is routine for engines (path canonicalisation,
+/// `http` → `https`) and keeps a private endpoint working. Every other target
+/// has to be a public http(s) URL; the engine resolver then refuses a name
+/// whose answer contains a private address.
+fn engine_redirect_allowed(previous: Option<&reqwest::Url>, target: &reqwest::Url) -> bool {
+    // Staying on the same origin is routine canonicalisation and keeps a
+    // private endpoint working. A different port is a different service, so
+    // it is not exempt: an engine on loopback must not be able to redirect
+    // onto another loopback service.
+    let same_origin = previous.is_some_and(|from| {
+        from.scheme() == target.scheme()
+            && from
+                .host_str()
+                .zip(target.host_str())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            && from.port_or_known_default() == target.port_or_known_default()
+    });
+    same_origin || crate::fetch::is_fetchable(target)
+}
+
+/// Hand the shared resolver to reqwest, whose builder wants a sized type.
+struct SharedResolver(Arc<dyn Resolve>);
+
+impl Resolve for SharedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        self.0.resolve(name)
+    }
+}
+
+/// The hosts of the engine endpoints the operator configured.
+///
+/// Those names are trusted configuration: a self-hosted engine may answer
+/// with a private address. Nothing else is exempt from the global-address
+/// rule, including every redirect target.
+fn configured_engine_hosts(settings: &Settings) -> Vec<String> {
+    settings
+        .engines
+        .iter()
+        .filter_map(|engine| engine.base_url.as_deref())
+        .filter_map(|base| reqwest::Url::parse(base).ok())
+        .filter_map(|url| url.host_str().map(str::to_string))
+        .collect()
+}
+
+/// The engine client's redirect policy: every hop is checked, like the
+/// direct-only client, instead of trusting the first URL only.
+fn engine_redirect_policy(max_redirects: usize) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= max_redirects {
+            return attempt.error("too many redirects");
+        }
+        if !engine_redirect_allowed(attempt.previous().last(), attempt.url()) {
+            return attempt.error("redirect target is not a public http(s) URL");
+        }
+        attempt.follow()
+    })
 }
 
 /// Concurrent media reads allowed in one process.
@@ -115,6 +187,7 @@ fn build_client(
     outgoing: &crate::settings::Outgoing,
     extra_proxy: Option<reqwest::Proxy>,
     redirects: reqwest::redirect::Policy,
+    resolver: Option<Arc<dyn Resolve>>,
 ) -> Result<reqwest::Client, NetworkError> {
     let mut builder = reqwest::Client::builder()
         .redirect(redirects)
@@ -143,6 +216,9 @@ fn build_client(
     }
     if !outgoing.enable_http2 {
         builder = builder.http1_only();
+    }
+    if let Some(resolver) = resolver {
+        builder = builder.dns_resolver(Arc::new(SharedResolver(resolver)));
     }
     if let Some(proxy) = extra_proxy {
         builder = builder.proxy(proxy);
@@ -179,7 +255,7 @@ fn build_client(
 pub(crate) fn api_client(
     outgoing: &crate::settings::Outgoing,
 ) -> Result<reqwest::Client, NetworkError> {
-    build_client(outgoing, None, reqwest::redirect::Policy::none())
+    build_client(outgoing, None, reqwest::redirect::Policy::none(), None)
 }
 
 impl Network {
@@ -192,15 +268,18 @@ impl Network {
 
     pub fn from_settings(settings: &Settings) -> Result<Self, NetworkError> {
         let outgoing = &settings.outgoing;
+        let resolver = crate::fetch::validated_resolver(configured_engine_hosts(settings));
         let client = build_client(
             outgoing,
             None,
-            reqwest::redirect::Policy::limited(outgoing.max_redirects),
+            engine_redirect_policy(outgoing.max_redirects),
+            Some(resolver.clone()),
         )?;
         let (media_client, media_proxy_blocked) =
             crate::fetch::public_client(outgoing, &[]).map_err(NetworkError::Build)?;
         Ok(Self {
             client,
+            resolver,
             media_client,
             media_proxy_blocked,
             proxied: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -296,7 +375,8 @@ impl Network {
         let client = build_client(
             &self.outgoing,
             Some(configured),
-            reqwest::redirect::Policy::limited(self.outgoing.max_redirects),
+            engine_redirect_policy(self.outgoing.max_redirects),
+            Some(self.resolver.clone()),
         )?;
         if let Ok(mut cache) = self.proxied.lock() {
             cache.insert(proxy.to_string(), client.clone());
@@ -348,7 +428,15 @@ impl Network {
         cache: Option<&Cache>,
         proxy: Option<&str>,
     ) -> Result<EngineResponse, NetworkError> {
-        self.fetch_inner(request, timeout, cache, proxy, None).await
+        self.fetch_inner(
+            request,
+            timeout,
+            cache,
+            proxy,
+            Some(ENGINE_MAX_BODY_BYTES),
+            false,
+        )
+        .await
     }
 
     /// Fetch an uncached image with a body limit.
@@ -358,7 +446,7 @@ impl Network {
         timeout: Duration,
         max_bytes: usize,
     ) -> Result<EngineResponse, NetworkError> {
-        self.fetch_inner(request, timeout, None, None, Some(max_bytes))
+        self.fetch_inner(request, timeout, None, None, Some(max_bytes), true)
             .await
     }
 
@@ -369,9 +457,10 @@ impl Network {
         cache: Option<&Cache>,
         proxy: Option<&str>,
         max_bytes: Option<usize>,
+        media: bool,
     ) -> Result<EngineResponse, NetworkError> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let (client, media_slot) = if max_bytes.is_some() {
+        let (client, media_slot) = if media {
             if self.media_proxy_blocked {
                 return Err(NetworkError::Build(
                     "media reads require direct connections; configured proxies cannot validate destinations".into(),
@@ -1389,9 +1478,9 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"not a certificate").unwrap();
         outgoing.ca_bundle = Some(file.path().to_string_lossy().into_owned());
-        assert!(build_client(&outgoing, None, reqwest::redirect::Policy::none()).is_err());
+        assert!(build_client(&outgoing, None, reqwest::redirect::Policy::none(), None).is_err());
         outgoing.ca_bundle = Some("/nonexistent/rustxng-ca.pem".into());
-        assert!(build_client(&outgoing, None, reqwest::redirect::Policy::none()).is_err());
+        assert!(build_client(&outgoing, None, reqwest::redirect::Policy::none(), None).is_err());
         assert!(outgoing.verify);
     }
 
@@ -1446,7 +1535,7 @@ mod tests {
             .proxies
             .insert("https".into(), "socks5h://127.0.0.1:9050".into());
         assert!(
-            build_client(&outgoing, None, reqwest::redirect::Policy::none()).is_ok(),
+            build_client(&outgoing, None, reqwest::redirect::Policy::none(), None).is_ok(),
             "an https-only route must build"
         );
 
@@ -1456,7 +1545,7 @@ mod tests {
             .insert("fpt".into(), "socks5h://127.0.0.1:9050".into());
         // A typo used to be accepted silently and then applied to every
         // scheme, which changed the egress route without any signal.
-        let error = match build_client(&outgoing, None, reqwest::redirect::Policy::none()) {
+        let error = match build_client(&outgoing, None, reqwest::redirect::Policy::none(), None) {
             Ok(_) => panic!("an unknown proxy key is a configuration error"),
             Err(error) => error,
         };
@@ -1484,6 +1573,7 @@ mod tests {
             host_spacing_overrides: Vec::new(),
             host_slots: std::sync::Mutex::new(std::collections::HashMap::new()),
             media_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MEDIA)),
+            resolver: crate::fetch::validated_resolver(Vec::new()),
         };
         let first = network.user_agent();
         let second = network.user_agent();
@@ -1887,5 +1977,99 @@ mod tests {
             "429 のあと 1 回だけリトライする"
         );
         server.abort();
+    }
+
+    #[test]
+    fn engine_redirects_may_not_leave_for_a_private_destination() {
+        let engine = reqwest::Url::parse("https://engine.example/search?q=x").unwrap();
+        for (target, expected) in [
+            ("https://engine.example/search?q=y", true),
+            ("https://engine.example:443/other", true),
+            ("https://cdn.example/answer.json", true),
+            ("http://engine.example/other", true),
+            ("https://engine.example:8443/other", false),
+            ("https://127.0.0.1/secret", false),
+            ("https://169.254.169.254/latest/meta-data/", false),
+            ("http://10.1.2.3/admin", false),
+            ("http://localhost:8080/", false),
+            ("http://[::1]/", false),
+            ("file:///etc/passwd", false),
+        ] {
+            let target = reqwest::Url::parse(target).unwrap();
+            assert_eq!(
+                engine_redirect_allowed(Some(&engine), &target),
+                expected,
+                "{target}"
+            );
+        }
+        // A configured private endpoint keeps working while the redirect stays
+        // on its own origin, but a hop onto another loopback port is another
+        // service and is refused.
+        let private = reqwest::Url::parse("http://127.0.0.1:8080/api").unwrap();
+        assert!(engine_redirect_allowed(
+            Some(&private),
+            &reqwest::Url::parse("http://127.0.0.1:8080/api/v2").unwrap()
+        ));
+        assert!(!engine_redirect_allowed(
+            Some(&private),
+            &reqwest::Url::parse("http://127.0.0.1:9090/admin").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn engine_redirects_to_private_targets_are_refused() {
+        use axum::Router;
+        use axum::response::Redirect;
+
+        // The engine answers 302 onto a host that is not its own. The client
+        // has to refuse the hop before it connects anywhere.
+        let app =
+            Router::new().fallback(|| async { Redirect::temporary("http://10.255.255.1/secret") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let network = Network::from_settings(&Settings::defaults()).unwrap();
+        let refused = network
+            .fetch(
+                EngineRequest::get(format!("http://{addr}/search")),
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .await;
+        server.abort();
+        let message = match refused {
+            Err(NetworkError::Transport(message)) => message,
+            other => panic!("the redirect has to be refused: {other:?}"),
+        };
+        assert!(message.contains("redirect"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn engine_bodies_are_cut_at_the_engine_limit() {
+        use axum::Router;
+
+        let app = Router::new().fallback(|| async { "A".repeat(ENGINE_MAX_BODY_BYTES + 1) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let network = Network::from_settings(&Settings::defaults()).unwrap();
+        let result = network
+            .fetch(
+                EngineRequest::get(format!("http://{addr}/search")),
+                Duration::from_secs(10),
+                None,
+                None,
+            )
+            .await;
+        server.abort();
+        assert!(
+            matches!(result, Err(NetworkError::TooLarge(ENGINE_MAX_BODY_BYTES))),
+            "{result:?}"
+        );
     }
 }
