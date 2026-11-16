@@ -34,16 +34,22 @@ pub struct AppState {
     pub base_url: Option<String>,
     /// Bot detection / rate limiter (\`server.limiter\`).
     pub limiter: Arc<limiter::Limiter>,
+    /// Concurrent `/research` requests (`research.max_concurrency`).
+    pub research_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
     pub fn new(searcher: Searcher) -> Self {
         let settings = searcher.settings.clone();
         let limiter = Arc::new(limiter::Limiter::from_settings(&settings));
+        let research_slots = Arc::new(tokio::sync::Semaphore::new(
+            settings.research.max_concurrency.max(1),
+        ));
         Self {
             searcher: Arc::new(searcher),
             base_url: None,
             limiter,
+            research_slots,
         }
     }
 
@@ -57,6 +63,13 @@ impl AppState {
             .unwrap_or_else(|| self.settings().base_url())
     }
 }
+
+/// Largest request body accepted by any endpoint.
+///
+/// `/search` (POST form) and `/preferences` carry a few hundred bytes; the
+/// 2 MiB default from axum is far more than either endpoint parses, and an
+/// oversized upload would be buffered before it is rejected.
+const MAX_REQUEST_BODY: usize = 64 * 1024;
 
 /// The router of the instance.
 pub fn router(state: AppState) -> Router {
@@ -79,13 +92,79 @@ pub fn router(state: AppState) -> Router {
         .route("/favicon_proxy", get(favicons::handler))
         .route("/research", get(handlers::research))
         .route("/healthz", get(handlers::healthz))
+        .route("/readyz", get(handlers::readyz))
         .route("/about", get(handlers::about))
         .route("/opensearch.xml", get(handlers::opensearch))
         .route("/robots.txt", get(handlers::robots))
         .route("/favicon.ico", get(handlers::favicon))
         .route("/static/style.css", get(handlers::style))
+        .route("/static/logo.png", get(handlers::logo))
+        .route("/static/logo-wordmark.png", get(handlers::wordmark))
+        .route("/static/logo-wordmark-light.png", get(handlers::wordmark_light))
         .fallback(handlers::not_found)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY))
+        // Extractor rejections (body too large, malformed query) are rendered
+        // by axum as plain text before a handler runs; a JSON caller should
+        // still receive JSON.
+        .layer(axum::middleware::from_fn(format_extractor_errors))
+        // Count responses by status class where every caller sees it: the
+        // binary, the tests and library users of `router`.
+        .layer(axum::middleware::from_fn({
+            let metrics = state.searcher.metrics.clone();
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let metrics = metrics.clone();
+                async move {
+                    let response = next.run(request).await;
+                    metrics.record_status(response.status().as_u16());
+                    response
+                }
+            }
+        }))
         .with_state(state)
+}
+
+/// Rewrite axum own rejections in the format the caller asked for.
+async fn format_extractor_errors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let wants_json = url::form_urlencoded::parse(
+        request.uri().query().unwrap_or_default().as_bytes(),
+    )
+    .any(|(name, value)| name == "format" && value == "json");
+    let response = next.run(request).await;
+    if !wants_json {
+        return response;
+    }
+    let status = response.status();
+    if !matches!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST
+            | axum::http::StatusCode::PAYLOAD_TOO_LARGE
+            | axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    ) {
+        return response;
+    }
+    let plain_text = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/plain"));
+    if !plain_text {
+        return response;
+    }
+    let message = axum::body::to_bytes(response.into_body(), 8 * 1024)
+        .await
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| format!("request rejected with {status}"));
+    (
+        status,
+        axum::Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
 }
 
 /// Render a template, turning errors into a 500 response.

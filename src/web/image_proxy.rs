@@ -12,6 +12,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::AppState;
+use super::limiter::ClientAddr;
 use crate::engine::EngineRequest;
 
 /// Maximum size of a proxied image (8 MiB, like upstream's `image_proxy_max_size`).
@@ -87,8 +88,16 @@ pub fn is_public_url(url: &str) -> bool {
 pub async fn handler(
     State(state): State<AppState>,
     Query(params): Query<ImageProxyParams>,
+    peer: ClientAddr,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    if let Some(response) = super::handlers::limiter_response(
+        &state,
+        "plain",
+        state.limiter.check(peer.0, &headers, "image"),
+    ) {
+        return response;
+    }
     let settings = state.settings();
     if !settings.server.image_proxy {
         return (

@@ -125,6 +125,14 @@ fn search_form(state: &AppState, headers: &HeaderMap, error: Option<String>) -> 
     })
 }
 
+/// Longest accepted query string, in characters.
+///
+/// The value bounds the URL every engine builds and the work done in query
+/// parsing; longer input is rejected with a 400 in the requested format.
+const MAX_QUERY_CHARS: usize = 2048;
+
+use crate::settings::MAX_PAGENO;
+
 /// Run a search and render it in the requested format.
 async fn run_search(
     state: AppState,
@@ -142,29 +150,33 @@ async fn run_search(
         .filter(|format| !format.is_empty())
         .unwrap_or_else(|| "html".to_string());
     if !settings.search.formats.contains(&format) {
-        return error_page(
+        return format_error(
             &state,
+            &format,
             StatusCode::BAD_REQUEST,
-            &format!("format {:?} is not enabled on this instance", format),
+            &format!("format {format:?} is not enabled on this instance"),
         );
     }
 
     let raw_query = params.q.clone().unwrap_or_default();
     if raw_query.trim().is_empty() {
-        return error_page(&state, StatusCode::BAD_REQUEST, "missing query");
+        return format_error(&state, &format, StatusCode::BAD_REQUEST, "missing query");
+    }
+    if raw_query.chars().count() > MAX_QUERY_CHARS {
+        return format_error(
+            &state,
+            &format,
+            StatusCode::BAD_REQUEST,
+            &format!("query is too long: the limit is {MAX_QUERY_CHARS} characters"),
+        );
     }
     let accept_language = match crate::fetch::AcceptLanguage::parse(
         params.accept_language.as_deref().unwrap_or_default(),
     ) {
         Ok(language) => language,
-        Err(message) if format == "json" => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({"error": message})),
-            )
-                .into_response();
+        Err(message) => {
+            return format_error(&state, &format, StatusCode::BAD_REQUEST, &message);
         }
-        Err(message) => return error_page(&state, StatusCode::BAD_REQUEST, &message),
     };
 
     let mut query = SearchQuery::parse(
@@ -183,14 +195,7 @@ async fn run_search(
     // paging links and never reached the engines.
     if let Some(language) = params.language.as_deref() {
         if let Err(message) = query.apply_language_param(language) {
-            if format == "json" {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(serde_json::json!({"error": message})),
-                )
-                    .into_response();
-            }
-            return error_page(&state, StatusCode::BAD_REQUEST, &message);
+            return format_error(&state, &format, StatusCode::BAD_REQUEST, &message);
         }
     }
     let language_requested = !query.languages.is_empty();
@@ -229,14 +234,7 @@ async fn run_search(
                 "timeout_limit must be a finite number of seconds greater than 0 and at most {}",
                 crate::aggregator::MAX_TIMEOUT_LIMIT
             );
-            if format == "json" {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(serde_json::json!({"error": message})),
-                )
-                    .into_response();
-            }
-            return error_page(&state, StatusCode::BAD_REQUEST, &message);
+            return format_error(&state, &format, StatusCode::BAD_REQUEST, &message);
         }
         query.timeout_limit = Some(timeout_limit);
     }
@@ -253,11 +251,20 @@ async fn run_search(
     } else {
         preferences.max_page
     };
-    if max_page > 0 && query.pageno > max_page {
-        return error_page(
+    // `search.max_page = 0` means "no configured limit", but the page number
+    // still feeds offset arithmetic inside every engine, so an unbounded value
+    // overflows those offsets (A16 in docs/AUDIT-2026-11-02.md).
+    let page_limit = if max_page > 0 {
+        max_page.min(MAX_PAGENO)
+    } else {
+        MAX_PAGENO
+    };
+    if query.pageno > page_limit {
+        return format_error(
             &state,
+            &format,
             StatusCode::BAD_REQUEST,
-            &format!("page number is out of range: {max_page} is the maximum number of pages"),
+            &format!("page number is out of range: {page_limit} is the maximum number of pages"),
         );
     }
 
@@ -268,8 +275,11 @@ async fn run_search(
     let language = query.engine_language();
 
     let user = user_info(&headers);
-    if let Some(response) = limiter_response(&state, state.limiter.check(peer.0, &headers, &format))
-    {
+    if let Some(response) = limiter_response(
+        &state,
+        &format,
+        state.limiter.check(peer.0, &headers, &format),
+    ) {
         return response;
     }
 
@@ -311,7 +321,7 @@ async fn run_search(
 
     let response = searcher.search(request).await;
     if let Some(error) = &response.error {
-        return error_page(&state, StatusCode::BAD_REQUEST, error);
+        return format_error(&state, &format, StatusCode::BAD_REQUEST, error);
     }
     if let Some(url) = response.redirect_url.clone() {
         return Redirect::to(&url).into_response();
@@ -483,12 +493,26 @@ fn results_page(
     })
 }
 
+/// Whole-request budget of `/autocompleter`.
+///
+/// Each backend is one outbound request, so the handler as a whole needs a
+/// bound that does not grow with the number of names in `backend=`.
+const AUTOCOMPLETE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `GET /autocompleter`.
 pub async fn autocompleter(
     State(state): State<AppState>,
     Query(params): Query<AutocompleteParams>,
+    peer: ClientAddr,
     headers: HeaderMap,
 ) -> Response {
+    if let Some(response) = limiter_response(
+        &state,
+        "json",
+        state.limiter.check(peer.0, &headers, "json"),
+    ) {
+        return response;
+    }
     let query = params.q.clone().unwrap_or_default();
     if query.trim().is_empty() {
         return axum::Json(Vec::<String>::new()).into_response();
@@ -515,24 +539,38 @@ pub async fn autocompleter(
         .clone()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| preferences.locale.clone());
-    let mut suggestions = Vec::new();
+    // `backend=` is caller input: keep only names this build actually knows,
+    // once each, so a long list cannot turn one request into many outbound
+    // calls. Unknown names used to fall through to DuckDuckGo.
+    let mut candidates: Vec<&str> = Vec::new();
     for candidate in backend.split(',') {
         let candidate = candidate.trim();
-        if candidate.is_empty() {
+        if candidate.is_empty() || !crate::autocomplete::BACKENDS.contains(&candidate) {
             continue;
         }
-        suggestions = crate::autocomplete::suggest(
-            &state.searcher.network,
-            state.settings(),
-            candidate,
-            &query,
-            &locale,
-        )
-        .await;
-        if !suggestions.is_empty() {
-            break;
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
         }
     }
+    let lookup = async {
+        for candidate in candidates {
+            let suggestions = crate::autocomplete::suggest(
+                &state.searcher.network,
+                state.settings(),
+                candidate,
+                &query,
+                &locale,
+            )
+            .await;
+            if !suggestions.is_empty() {
+                return suggestions;
+            }
+        }
+        Vec::new()
+    };
+    let suggestions = tokio::time::timeout(AUTOCOMPLETE_DEADLINE, lookup)
+        .await
+        .unwrap_or_default();
     axum::Json(suggestions).into_response()
 }
 
@@ -871,6 +909,9 @@ fn prometheus_metrics(state: &AppState) -> String {
     let counter = |name: &str, help: &str, out: &mut String| {
         out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
     };
+    let gauge = |name: &str, help: &str, out: &mut String| {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+    };
     counter(
         "searxng_search_requests_total",
         "Number of searches served",
@@ -893,6 +934,16 @@ fn prometheus_metrics(state: &AppState) -> String {
         "# HELP searxng_uptime_seconds Process uptime\n# TYPE searxng_uptime_seconds gauge\n",
     );
     out.push_str(&format!("searxng_uptime_seconds {:.3}\n", metrics.uptime));
+    out.push_str("# HELP searxng_search_duration_seconds_sum Total time spent inside searches\n# TYPE searxng_search_duration_seconds_sum counter\n");
+    out.push_str(&format!(
+        "searxng_search_duration_seconds_sum {:.6}\n",
+        metrics.search_duration_micros as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP searxng_search_duration_seconds_count Searches that contributed to the sum\n# TYPE searxng_search_duration_seconds_count counter\n");
+    out.push_str(&format!(
+        "searxng_search_duration_seconds_count {}\n",
+        metrics.search_duration_count
+    ));
     counter("searxng_cache_hit_total", "Number of cache hits", &mut out);
     out.push_str(&format!("searxng_cache_hit_total {}\n", cache.hit));
     counter(
@@ -905,6 +956,74 @@ fn prometheus_metrics(state: &AppState) -> String {
         "# HELP searxng_cache_entries Cached responses\n# TYPE searxng_cache_entries gauge\n",
     );
     out.push_str(&format!("searxng_cache_entries {}\n", cache.entries));
+    counter(
+        "searxng_cache_error_total",
+        "Cache backend errors (decode or transport)",
+        &mut out,
+    );
+    out.push_str(&format!("searxng_cache_error_total {}\n", cache.error));
+    gauge(
+        "searxng_cache_bytes",
+        "Bytes held by the in-memory cache",
+        &mut out,
+    );
+    out.push_str(&format!("searxng_cache_bytes {}\n", cache.bytes));
+
+    // Readiness is the same evaluation `/readyz` and `--check-config` use, so
+    // an alert and a health probe cannot disagree about what "ready" means.
+    let readiness = crate::diagnostics::Readiness::evaluate(
+        state.settings(),
+        state.searcher.registry.len(),
+    );
+    gauge(
+        "searxng_ready",
+        "1 when a search source (engine or local index) is configured",
+        &mut out,
+    );
+    out.push_str(&format!("searxng_ready {}\n", u8::from(readiness.ready)));
+    gauge(
+        "searxng_engines_configured",
+        "Engines built from the configuration",
+        &mut out,
+    );
+    out.push_str(&format!("searxng_engines_configured {}\n", readiness.engines));
+    gauge(
+        "searxng_local_index",
+        "1 when a configured local index exists on disk",
+        &mut out,
+    );
+    out.push_str(&format!("searxng_local_index {}\n", u8::from(readiness.local_index)));
+
+    let limiter = state.limiter.stats();
+    out.push_str("# HELP searxng_limiter_requests_total Requests seen by the limiter, by verdict\n# TYPE searxng_limiter_requests_total counter\n");
+    out.push_str(&format!(
+        "searxng_limiter_requests_total{{verdict=\"allowed\"}} {}\n",
+        limiter.allowed
+    ));
+    out.push_str(&format!(
+        "searxng_limiter_requests_total{{verdict=\"challenged\"}} {}\n",
+        limiter.challenged
+    ));
+    out.push_str(&format!(
+        "searxng_limiter_requests_total{{verdict=\"blocked\"}} {}\n",
+        limiter.blocked
+    ));
+    gauge(
+        "searxng_limiter_tracked",
+        "Clients currently tracked by the limiter",
+        &mut out,
+    );
+    out.push_str(&format!("searxng_limiter_tracked {}\n", limiter.tracked));
+
+    out.push_str("# HELP searxng_http_responses_total HTTP responses by status class\n# TYPE searxng_http_responses_total counter\n");
+    for (class, value) in [
+        ("2xx", metrics.response_2xx),
+        ("3xx", metrics.response_3xx),
+        ("4xx", metrics.response_4xx),
+        ("5xx", metrics.response_5xx),
+    ] {
+        out.push_str(&format!("searxng_http_responses_total{{status=\"{class}\"}} {value}\n"));
+    }
 
     out.push_str("# HELP searxng_engines_request_count_total Requests sent to an engine\n# TYPE searxng_engines_request_count_total counter\n");
     out.push_str("# HELP searxng_engines_result_count_total Results returned by an engine\n# TYPE searxng_engines_result_count_total counter\n");
@@ -976,10 +1095,13 @@ pub async fn research(
 ) -> Response {
     let question = params.q.clone().unwrap_or_default();
     if question.trim().is_empty() {
-        return error_page(&state, StatusCode::BAD_REQUEST, "missing question");
+        return format_error(&state, "json", StatusCode::BAD_REQUEST, "missing question");
     }
-    if let Some(response) = limiter_response(&state, state.limiter.check(peer.0, &headers, "json"))
-    {
+    if let Some(response) = limiter_response(
+        &state,
+        "json",
+        state.limiter.check(peer.0, &headers, "json"),
+    ) {
         return response;
     }
     let settings = state.settings();
@@ -991,15 +1113,63 @@ pub async fn research(
         .max_sources
         .unwrap_or(settings.research.max_sources)
         .clamp(1, 50);
-    let report = state
-        .searcher
-        .research(&question, max_queries, max_sources)
-        .await;
+    // Sub-queries and page fetches run one after another, so the endpoint needs
+    // its own deadline and a bound on concurrent work: without them one caller
+    // can hold the worker and amplify outbound requests.
+    let Ok(_slot) = state.research_slots.clone().try_acquire_owned() else {
+        return format_error(
+            &state,
+            "json",
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many concurrent research requests; retry later",
+        );
+    };
+    let deadline = std::time::Duration::from_secs(settings.research.deadline.max(1));
+    let report = match tokio::time::timeout(
+        deadline,
+        state.searcher.research(&question, max_queries, max_sources),
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(_) => {
+            return format_error(
+                &state,
+                "json",
+                StatusCode::GATEWAY_TIMEOUT,
+                &format!(
+                    "research did not finish within {}s; reduce max_queries or max_sources",
+                    deadline.as_secs()
+                ),
+            );
+        }
+    };
     axum::Json(report).into_response()
 }
 
 pub async fn healthz() -> Response {
     (StatusCode::OK, "OK").into_response()
+}
+
+/// `GET /readyz` — can this instance return search results at all?
+///
+/// `/healthz` only proves that the process answers. This endpoint reports the
+/// configured sources: a profile without a usable engine and without a local
+/// index can serve pages but cannot search. It never contacts a provider, so a
+/// 200 means "nothing local is missing", not "every provider is reachable".
+pub async fn readyz(State(state): State<AppState>) -> Response {
+    // The CLI (`--check-config`) evaluates the same structure, so the endpoint
+    // and the startup check cannot disagree about what "ready" means.
+    let readiness = crate::diagnostics::Readiness::evaluate(
+        state.settings(),
+        state.searcher.registry.len(),
+    );
+    let status = if readiness.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, axum::Json(readiness)).into_response()
 }
 
 /// `GET /about`.
@@ -1028,9 +1198,39 @@ pub async fn robots() -> Response {
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
 }
 
+/// Serve a file that is compiled into the binary.
+fn static_file(bytes: &'static [u8], content_type: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 /// `GET /favicon.ico`.
 pub async fn favicon() -> Response {
-    StatusCode::NO_CONTENT.into_response()
+    static_file(include_bytes!("../../static/favicon.ico"), "image/x-icon")
+}
+
+/// `GET /static/logo.png` — the square mark.
+pub async fn logo() -> Response {
+    static_file(include_bytes!("../../static/logo.png"), "image/png")
+}
+
+/// `GET /static/logo-wordmark.png` — the wordmark for light backgrounds.
+pub async fn wordmark() -> Response {
+    static_file(include_bytes!("../../static/logo-wordmark.png"), "image/png")
+}
+
+/// `GET /static/logo-wordmark-light.png` — the wordmark for dark backgrounds.
+pub async fn wordmark_light() -> Response {
+    static_file(
+        include_bytes!("../../static/logo-wordmark-light.png"),
+        "image/png",
+    )
 }
 
 /// `GET /static/style.css`.
@@ -1048,7 +1248,11 @@ pub async fn not_found(State(state): State<AppState>) -> Response {
 }
 
 /// Render a rejected request's limiter response.
-fn limiter_response(state: &AppState, verdict: LimiterVerdict) -> Option<Response> {
+pub(super) fn limiter_response(
+    state: &AppState,
+    format: &str,
+    verdict: LimiterVerdict,
+) -> Option<Response> {
     let (retry_after, message, set_cookie) = match verdict {
         LimiterVerdict::Allow => return None,
         LimiterVerdict::Blocked {
@@ -1062,7 +1266,7 @@ fn limiter_response(state: &AppState, verdict: LimiterVerdict) -> Option<Respons
         } => (retry_after, message, Some(set_cookie)),
         LimiterVerdict::Redirect => return Some(Redirect::to("/").into_response()),
     };
-    let mut response = error_page(state, StatusCode::TOO_MANY_REQUESTS, &message);
+    let mut response = format_error(state, format, StatusCode::TOO_MANY_REQUESTS, &message);
     if retry_after > 0
         && let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string())
     {
@@ -1074,6 +1278,23 @@ fn limiter_response(state: &AppState, verdict: LimiterVerdict) -> Option<Respons
         response.headers_mut().append(header::SET_COOKIE, value);
     }
     Some(response)
+}
+
+/// Render a rejected request in the format the caller asked for.
+///
+/// A JSON client cannot read an HTML error page, so the reason has to travel
+/// in the body contract the request selected. HTML stays the default.
+fn format_error(state: &AppState, format: &str, status: StatusCode, message: &str) -> Response {
+    match format {
+        "json" => (status, axum::Json(serde_json::json!({ "error": message }))).into_response(),
+        "csv" | "rss" | "plain" => (
+            status,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            message.to_string(),
+        )
+            .into_response(),
+        _ => error_page(state, status, message),
+    }
 }
 
 fn error_page(state: &AppState, status: StatusCode, message: &str) -> Response {

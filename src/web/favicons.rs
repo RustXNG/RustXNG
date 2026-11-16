@@ -91,8 +91,16 @@ pub fn favicon_url(base_url: &str, secret: &str, result_url: &str) -> String {
 pub async fn handler(
     State(state): State<AppState>,
     Query(params): Query<FaviconParams>,
-    _headers: HeaderMap,
+    peer: super::limiter::ClientAddr,
+    headers: HeaderMap,
 ) -> Response {
+    if let Some(response) = super::handlers::limiter_response(
+        &state,
+        "plain",
+        state.limiter.check(peer.0, &headers, "image"),
+    ) {
+        return response;
+    }
     let settings = state.settings();
     if !settings.server.image_proxy {
         return (
@@ -233,6 +241,7 @@ mod tests {
                 url: "https://example.com".into(),
                 h: Some(signature(&secret(), "https://example.com")),
             }),
+            crate::web::limiter::ClientAddr(None),
             HeaderMap::new(),
         )
         .await;
@@ -249,6 +258,7 @@ mod tests {
                 url: "https://example.com/".to_string(),
                 h: None,
             }),
+            crate::web::limiter::ClientAddr(None),
             HeaderMap::new(),
         )
         .await;
@@ -261,6 +271,7 @@ mod tests {
                 url: "https://example.com/".to_string(),
                 h: Some("0".repeat(64)),
             }),
+            crate::web::limiter::ClientAddr(None),
             HeaderMap::new(),
         )
         .await;
@@ -274,6 +285,7 @@ mod tests {
                 url: origin.to_string(),
                 h: Some(signature(&secret(), origin)),
             }),
+            crate::web::limiter::ClientAddr(None),
             HeaderMap::new(),
         )
         .await;
