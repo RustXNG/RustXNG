@@ -35,7 +35,6 @@ pub mod engine;
 pub mod engines;
 pub mod external_bangs;
 pub mod fetch;
-pub mod i18n;
 pub mod locales;
 pub mod localindex;
 pub mod mcp;
@@ -51,7 +50,6 @@ pub mod settings;
 pub mod update;
 pub mod version;
 pub mod web;
-pub mod wikidata_infobox;
 pub mod wikitext;
 
 pub use aggregator::{SearchRequest, SearchResponse, Searcher};
