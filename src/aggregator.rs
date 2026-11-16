@@ -294,6 +294,11 @@ async fn bounded_index_search(
 /// index (the encyclopedia) is exempt: every hit is the same host.
 const MAX_PER_HOST: usize = 3;
 
+/// Upper bound of the page bodies fetched for one search response.
+///
+/// Each body is buffered in memory; the shipped default is 5.
+const MAX_RAW_CONTENT_LIMIT: usize = 10;
+
 /// Keep at most MAX hits per host, best first.
 fn cap_per_host(hits: Vec<crate::localindex::Hit>, max: usize) -> Vec<crate::localindex::Hit> {
     let hosts: std::collections::HashSet<_> = hits
@@ -566,7 +571,14 @@ impl Searcher {
     }
 
     /// Run a search: this is the entry point used by the web layer.
-    pub async fn search(&self, mut request: SearchRequest) -> SearchResponse {
+    pub async fn search(&self, request: SearchRequest) -> SearchResponse {
+        let started = std::time::Instant::now();
+        let response = self.search_inner(request).await;
+        self.metrics.record_search_duration(started.elapsed());
+        response
+    }
+
+    async fn search_inner(&self, mut request: SearchRequest) -> SearchResponse {
         Metrics::incr(&self.metrics.searches, 1);
         let context = PluginContext {
             search_query: request.query.query_text(),
@@ -1364,7 +1376,13 @@ impl Searcher {
         results: &mut [SearchResult],
         language: &crate::fetch::AcceptLanguage,
     ) {
-        let limit = self.settings.search.raw_content_limit.max(1);
+        // Every fetched body is buffered, so the fan-out stays small even
+        // when a settings file asks for an unbounded page count.
+        let limit = self
+            .settings
+            .search
+            .raw_content_limit
+            .clamp(1, MAX_RAW_CONTENT_LIMIT);
         let count = results.len().min(limit);
         let texts = futures::future::join_all(
             results

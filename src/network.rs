@@ -5,6 +5,7 @@
 //! response cache.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -98,7 +99,16 @@ pub struct Network {
     host_spacing_overrides: Vec<(String, Duration)>,
     /// Earliest start of the next request per host.
     host_slots: std::sync::Mutex<std::collections::HashMap<String, tokio::time::Instant>>,
+    /// Concurrent media reads (`fetch_image`).
+    media_slots: Arc<tokio::sync::Semaphore>,
 }
+
+/// Concurrent media reads allowed in one process.
+///
+/// Every media response is buffered in memory (up to 8 MiB for an image), so
+/// an unbounded fan-out from `/image_proxy` or `/favicon_proxy` is a memory and
+/// upstream-load amplifier. Four keeps the worst case near 32 MiB.
+const MAX_CONCURRENT_MEDIA: usize = 4;
 
 /// Build a client from the outgoing settings, optionally through another proxy.
 fn build_client(
@@ -137,9 +147,22 @@ fn build_client(
     if let Some(proxy) = extra_proxy {
         builder = builder.proxy(proxy);
     } else {
-        for (scheme, proxy) in &outgoing.proxies {
-            let proxy = reqwest::Proxy::all(proxy)
-                .map_err(|error| NetworkError::Build(error.to_string()))?;
+        for (scheme, address) in &outgoing.proxies {
+            // `proxies` is keyed per scheme. Registering every entry with
+            // `Proxy::all` made the first key (BTreeMap order) capture every
+            // request, so an intended `https` route silently used `http`.
+            let scheme = scheme.trim().to_ascii_lowercase();
+            let proxy = match scheme.as_str() {
+                "all" => reqwest::Proxy::all(address),
+                "http" => reqwest::Proxy::http(address),
+                "https" => reqwest::Proxy::https(address),
+                other => {
+                    return Err(NetworkError::Build(format!(
+                        "unsupported proxy key {other:?}: use all, http or https"
+                    )));
+                }
+            };
+            let proxy = proxy.map_err(|error| NetworkError::Build(error.to_string()))?;
             tracing::debug!(scheme, "configured proxy");
             builder = builder.proxy(proxy);
         }
@@ -202,6 +225,7 @@ impl Network {
                 })
                 .collect(),
             host_slots: std::sync::Mutex::new(std::collections::HashMap::new()),
+            media_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MEDIA)),
         })
     }
 
@@ -347,7 +371,7 @@ impl Network {
         max_bytes: Option<usize>,
     ) -> Result<EngineResponse, NetworkError> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let client = if max_bytes.is_some() {
+        let (client, media_slot) = if max_bytes.is_some() {
             if self.media_proxy_blocked {
                 return Err(NetworkError::Build(
                     "media reads require direct connections; configured proxies cannot validate destinations".into(),
@@ -360,10 +384,17 @@ impl Network {
                     "only public http(s) media can be fetched".into(),
                 ));
             }
-            self.media_client.clone()
+            // Bound the concurrent buffered bodies; the permit is released
+            // when this request finishes or its deadline expires.
+            let slot = tokio::time::timeout_at(deadline, self.media_slots.clone().acquire_owned())
+                .await
+                .map_err(|_| NetworkError::Timeout)?
+                .map_err(|_| NetworkError::Build("media fetch slots are closed".into()))?;
+            (self.media_client.clone(), Some(slot))
         } else {
-            self.client_for(proxy)?
+            (self.client_for(proxy)?, None)
         };
+        let _media_slot = media_slot;
         let cache_key = cache
             .map(|_| request_cache_key(&request, proxy))
             .transpose()?;
@@ -377,10 +408,9 @@ impl Network {
                 {
                     return Ok(cached_response(cached));
                 }
-                let guard =
-                    tokio::time::timeout_at(deadline, cache.request_lock(key).lock_owned())
-                        .await
-                        .map_err(|_| NetworkError::Timeout)?;
+                let guard = tokio::time::timeout_at(deadline, cache.request_lock(key).lock_owned())
+                    .await
+                    .map_err(|_| NetworkError::Timeout)?;
                 // A previous caller may have populated the cache while we waited.
                 if let Some(cached) = tokio::time::timeout_at(deadline, cache.get(key))
                     .await
@@ -639,7 +669,10 @@ struct Revalidation {
 impl Revalidation {
     fn from_stale(stale: &CachedResponse) -> Option<Self> {
         let etag = stale.etag.clone().filter(|value| !value.is_empty());
-        let last_modified = stale.last_modified.clone().filter(|value| !value.is_empty());
+        let last_modified = stale
+            .last_modified
+            .clone()
+            .filter(|value| !value.is_empty());
         if etag.is_none() && last_modified.is_none() {
             None
         } else {
@@ -971,7 +1004,7 @@ mod tests {
     #[tokio::test]
     async fn not_modified_reuses_the_stale_body_and_extends_the_ttl() {
         use axum::response::IntoResponse;
-        use axum::{routing::get, Router};
+        use axum::{Router, routing::get};
         use std::sync::Arc;
 
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1059,7 +1092,7 @@ mod tests {
 
     #[tokio::test]
     async fn entries_without_validators_are_refetched_in_full() {
-        use axum::{routing::get, Router};
+        use axum::{Router, routing::get};
         use std::sync::Arc;
 
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1116,7 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn last_modified_alone_sends_if_modified_since() {
         use axum::response::IntoResponse;
-        use axum::{routing::get, Router};
+        use axum::{Router, routing::get};
         use std::sync::Arc;
 
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1185,7 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn both_validators_are_sent_and_new_content_replaces_the_cache() {
         use axum::response::IntoResponse;
-        use axum::{routing::get, Router};
+        use axum::{Router, routing::get};
         use std::sync::Arc;
 
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1200,8 +1233,7 @@ mod tests {
                 async move {
                     let hit = counter.fetch_add(1, Ordering::SeqCst) + 1;
                     seen.record(&headers);
-                    let if_none_match =
-                        headers.get("if-none-match").and_then(|v| v.to_str().ok());
+                    let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
                     if if_none_match == Some("\"v2\"") {
                         axum::http::StatusCode::NOT_MODIFIED.into_response()
                     } else if hit == 1 {
@@ -1296,7 +1328,7 @@ mod tests {
     #[tokio::test]
     async fn a_fully_cleared_cache_fetches_without_conditional_headers() {
         use axum::response::IntoResponse;
-        use axum::{routing::get, Router};
+        use axum::{Router, routing::get};
         use std::sync::Arc;
 
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1311,11 +1343,7 @@ mod tests {
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
                     seen.record(&headers);
-                    (
-                        [(axum::http::header::ETAG, "\"v1\"")],
-                        "content-v1",
-                    )
-                        .into_response()
+                    ([(axum::http::header::ETAG, "\"v1\"")], "content-v1").into_response()
                 }
             }),
         );
@@ -1367,6 +1395,77 @@ mod tests {
         assert!(outgoing.verify);
     }
 
+    /// The media budget is a fixed number of slots, and every attempt must
+    /// give its slot back even when the fetch fails or times out.
+    #[tokio::test]
+    async fn media_fetches_release_their_slot() {
+        let network = Network::from_settings(&crate::settings::Settings::defaults()).unwrap();
+        assert_eq!(
+            network.media_slots.available_permits(),
+            MAX_CONCURRENT_MEDIA,
+            "the media budget must start full"
+        );
+        for _ in 0..(MAX_CONCURRENT_MEDIA + 2) {
+            let request = EngineRequest::get("https://media.invalid/x.png");
+            let outcome = network
+                .fetch_image(request, Duration::from_millis(50), 1024)
+                .await;
+            assert!(outcome.is_err(), "an unresolvable host cannot succeed");
+            assert_eq!(
+                network.media_slots.available_permits(),
+                MAX_CONCURRENT_MEDIA,
+                "a failed media read must not leak its slot"
+            );
+        }
+    }
+
+    /// Only `MAX_CONCURRENT_MEDIA` media reads can run at once.
+    #[tokio::test]
+    async fn media_reads_are_bounded_by_the_slot_count() {
+        let network = Network::from_settings(&crate::settings::Settings::defaults()).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_MEDIA {
+            held.push(
+                network
+                    .media_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("the budget starts full"),
+            );
+        }
+        assert!(
+            network.media_slots.clone().try_acquire_owned().is_err(),
+            "the budget must not grow past MAX_CONCURRENT_MEDIA"
+        );
+    }
+
+    #[test]
+    fn proxy_keys_select_the_scheme_they_name() {
+        let mut outgoing = crate::settings::Outgoing::default();
+        outgoing
+            .proxies
+            .insert("https".into(), "socks5h://127.0.0.1:9050".into());
+        assert!(
+            build_client(&outgoing, None, reqwest::redirect::Policy::none()).is_ok(),
+            "an https-only route must build"
+        );
+
+        outgoing.proxies.clear();
+        outgoing
+            .proxies
+            .insert("fpt".into(), "socks5h://127.0.0.1:9050".into());
+        // A typo used to be accepted silently and then applied to every
+        // scheme, which changed the egress route without any signal.
+        let error = match build_client(&outgoing, None, reqwest::redirect::Policy::none()) {
+            Ok(_) => panic!("an unknown proxy key is a configuration error"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unsupported proxy key"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn user_agents_are_diverse_and_plausible() {
         let network = Network {
@@ -1384,6 +1483,7 @@ mod tests {
             host_spacing: Duration::ZERO,
             host_spacing_overrides: Vec::new(),
             host_slots: std::sync::Mutex::new(std::collections::HashMap::new()),
+            media_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MEDIA)),
         };
         let first = network.user_agent();
         let second = network.user_agent();
@@ -1743,7 +1843,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_request_retries_once() {
         use axum::response::IntoResponse;
-        use axum::{routing::get, Router};
+        use axum::{Router, routing::get};
         use std::sync::Arc;
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1781,8 +1881,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status, 200);
-        assert_eq!(calls.load(Ordering::Relaxed), 2, "429 のあと 1 回だけリトライする");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "429 のあと 1 回だけリトライする"
+        );
         server.abort();
     }
-
 }
