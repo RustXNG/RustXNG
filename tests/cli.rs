@@ -50,7 +50,11 @@ fn check_config_reports_a_profile_without_sources() {
     )
     .expect("write settings");
     let output = binary()
-        .args(["--check-config", "--config", path.to_str().expect("utf-8 path")])
+        .args([
+            "--check-config",
+            "--config",
+            path.to_str().expect("utf-8 path"),
+        ])
         .output()
         .expect("run the binary");
     assert!(output.status.success());
@@ -66,7 +70,11 @@ fn check_config_fails_on_malformed_settings() {
     let path = dir.path().join("settings.toml");
     std::fs::write(&path, "server = \"not a table\"\n").expect("write settings");
     let output = binary()
-        .args(["--check-config", "--config", path.to_str().expect("utf-8 path")])
+        .args([
+            "--check-config",
+            "--config",
+            path.to_str().expect("utf-8 path"),
+        ])
         .output()
         .expect("run the binary");
     assert!(!output.status.success());
@@ -145,7 +153,11 @@ fn sigterm_stops_the_server_gracefully() {
     loop {
         match child.try_wait().expect("wait for the server") {
             Some(status) => {
-                assert_eq!(status.code(), Some(0), "SIGTERM must stop the server cleanly");
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "SIGTERM must stop the server cleanly"
+                );
                 return;
             }
             None if Instant::now() >= deadline => {

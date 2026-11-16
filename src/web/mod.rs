@@ -100,7 +100,10 @@ pub fn router(state: AppState) -> Router {
         .route("/static/style.css", get(handlers::style))
         .route("/static/logo.png", get(handlers::logo))
         .route("/static/logo-wordmark.png", get(handlers::wordmark))
-        .route("/static/logo-wordmark-light.png", get(handlers::wordmark_light))
+        .route(
+            "/static/logo-wordmark-light.png",
+            get(handlers::wordmark_light),
+        )
         .fallback(handlers::not_found)
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY))
         // Extractor rejections (body too large, malformed query) are rendered
@@ -129,10 +132,9 @@ async fn format_extractor_errors(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
-    let wants_json = url::form_urlencoded::parse(
-        request.uri().query().unwrap_or_default().as_bytes(),
-    )
-    .any(|(name, value)| name == "format" && value == "json");
+    let wants_json =
+        url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+            .any(|(name, value)| name == "format" && value == "json");
     let response = next.run(request).await;
     if !wants_json {
         return response;
@@ -160,11 +162,7 @@ async fn format_extractor_errors(
         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| format!("request rejected with {status}"));
-    (
-        status,
-        axum::Json(serde_json::json!({ "error": message })),
-    )
-        .into_response()
+    (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 /// Render a template, turning errors into a 500 response.

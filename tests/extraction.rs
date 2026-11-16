@@ -17,7 +17,10 @@ fn spaced_punctuation(text: &str) -> usize {
     let bytes: Vec<char> = text.chars().collect();
     bytes
         .windows(2)
-        .filter(|pair| pair[0].is_whitespace() && matches!(pair[1], '.' | ',' | ':' | ';' | '!' | '?' | ')' | ']'))
+        .filter(|pair| {
+            pair[0].is_whitespace()
+                && matches!(pair[1], '.' | ',' | ':' | ';' | '!' | '?' | ')' | ']')
+        })
         .count()
 }
 
@@ -39,18 +42,34 @@ fn every_page_keeps_its_content_and_drops_page_chrome() {
 
         for expected in entry["must_contain"].as_array().expect("must_contain") {
             let expected = expected.as_str().expect("string");
-            assert!(text.contains(expected), "{name}: missing {expected:?}\n---\n{text}");
+            assert!(
+                text.contains(expected),
+                "{name}: missing {expected:?}\n---\n{text}"
+            );
         }
-        for unexpected in entry["must_not_contain"].as_array().expect("must_not_contain") {
+        for unexpected in entry["must_not_contain"]
+            .as_array()
+            .expect("must_not_contain")
+        {
             let unexpected = unexpected.as_str().expect("string");
-            assert!(!text.contains(unexpected), "{name}: kept {unexpected:?}\n---\n{text}");
+            assert!(
+                !text.contains(unexpected),
+                "{name}: kept {unexpected:?}\n---\n{text}"
+            );
         }
         let min = entry["min_chars"].as_u64().expect("min_chars") as usize;
-        assert!(text.chars().count() >= min, "{name}: only {} chars", text.chars().count());
+        assert!(
+            text.chars().count() >= min,
+            "{name}: only {} chars",
+            text.chars().count()
+        );
         let spaced = spaced_punctuation(&text);
         // `tidy` removes the space that joining inline elements leaves before
         // closing punctuation; the corpus keeps that from regressing.
-        assert_eq!(spaced, 0, "{name}: {spaced} spaced punctuation marks\n---\n{text}");
+        assert_eq!(
+            spaced, 0,
+            "{name}: {spaced} spaced punctuation marks\n---\n{text}"
+        );
         reported.push((name.to_string(), text.chars().count(), spaced));
     }
 

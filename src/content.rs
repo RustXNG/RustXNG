@@ -186,14 +186,11 @@ fn repeats_a_formula(element: &ElementRef<'_>) -> bool {
     ) {
         return true;
     }
-    element
-        .value()
-        .attr("class")
-        .is_some_and(|classes| {
-            classes
-                .split_whitespace()
-                .any(|class| matches!(class, "katex-html" | "MJX-TEX"))
-        })
+    element.value().attr("class").is_some_and(|classes| {
+        classes
+            .split_whitespace()
+            .any(|class| matches!(class, "katex-html" | "MJX-TEX"))
+    })
 }
 
 /// The readable text of one formula: the original TeX annotation when the
@@ -595,7 +592,11 @@ mod tests {
              </span></span></span></article></body></html>",
         );
         let text = main_text(&html);
-        assert_eq!(text.matches("π").count(), 0, "the visual copy is skipped: {text}");
+        assert_eq!(
+            text.matches("π").count(),
+            0,
+            "the visual copy is skipped: {text}"
+        );
         assert!(text.contains("e^{i\\pi}"), "{text}");
     }
 

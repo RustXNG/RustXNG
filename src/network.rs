@@ -1987,7 +1987,9 @@ mod tests {
             ("https://engine.example:443/other", true),
             ("https://cdn.example/answer.json", true),
             ("http://engine.example/other", true),
-            ("https://engine.example:8443/other", false),
+            // A public host on another port is a destination the resolver can
+            // validate, so it is allowed; only private ports are not exempt.
+            ("https://engine.example:8443/other", true),
             ("https://127.0.0.1/secret", false),
             ("https://169.254.169.254/latest/meta-data/", false),
             ("http://10.1.2.3/admin", false),

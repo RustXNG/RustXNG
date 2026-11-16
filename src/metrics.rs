@@ -53,8 +53,10 @@ impl Metrics {
 
     /// Record how long one search took.
     pub fn record_search_duration(&self, duration: std::time::Duration) {
-        self.search_duration_micros
-            .fetch_add(duration.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.search_duration_micros.fetch_add(
+            duration.as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
         self.search_duration_count.fetch_add(1, Ordering::Relaxed);
     }
 
