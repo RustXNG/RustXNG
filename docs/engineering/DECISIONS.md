@@ -51,6 +51,23 @@ ADR 形式。各決定に「理由」「代替案」「影響」を付ける。�
 - 理由: 取得した本文を同時にメモリへ保持する。既定 5 は維持。
 - 影響: 10 を超える設定は 10 として扱われる。
 
+## D22: readiness は「開けた索引」で判断する
+
+- 決定: `Readiness::evaluate` は `Searcher` が実際に開いた索引の有無を受け取る（`None` のときだけパス存在で代替）。
+- 理由: `meta.json` の存在だけでは壊れた索引を ready と誤判定する（実測）。
+- 影響: `--check-config` と `/readyz` は同じ Searcher から判定するため一致したまま。
+
+## D21: media プロキシは html バケットで数える
+
+- 決定: `/image_proxy`・`/favicon_proxy`・`/autocompleter` は limiter の html バケットを使う（`/research` は JSON のまま）。
+- 理由: 上流は `format != html` のときだけ API_WINDOW を加算する。ページ表示の favicon で API 枠を食うのは上流不一致。
+- 影響: API 予算が検索 API 専用になる。burst/long は全リクエスト共通のまま。
+
+## D20: engine クライアントも宛先検証する（設定ホストだけ例外）
+
+- 決定: engine 用 client に検証リゾルバとリダイレクト検証を入れ、本文を 8 MiB で打ち切る。例外は `base_url` のホストのみ。
+- 理由: engine 応答も信頼できない。operator 設定のホストは信頼するが、リダイレクト先には適用しない。
+- 残課題: `search_url` のみを持つ自己ホスト engine は例外にならない（RISKS R11）。
 ## D19: URL 検証は型ではなく接続時の検査を維持する
 
 - 決定: `ValidatedUrl` のような newtype を導入しない。

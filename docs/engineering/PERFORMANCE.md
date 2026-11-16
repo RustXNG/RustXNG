@@ -131,3 +131,21 @@ slim は **8,530,800 bytes（24.0%）小さい**。DB を検索元に使わな�
 `src/localindex.rs` は変更していない（実験後に復元済み）。この索引は文書サイト 41k ページのみで、
 gold に Wikipedia・論文・公式サイトを含む 100 問のうち到達不能な問いが多く、スコア自体が索引範囲に
 縛られる。ランキング定数の調整より、索引の収録範囲を広げる方が効く可能性が高い（外部判断）。
+
+## 依存とビルドの実測（2026-11-17）
+
+| 指標 | 実測 | 条件 |
+| --- | --- | --- |
+| 依存パッケージ数 | 442 | `cargo metadata --locked` |
+| 直接依存（`[dependencies]`） | 34 | Cargo.toml |
+| release ビルド（既定 features、依存キャッシュあり） | 1 分 59 秒（wall 119.65s / user 240.42s） | `cargo clean -p rustxng` 後 |
+| release ビルド（`--no-default-features`） | 1 分 44 秒（wall 104.25s / user 200.02s） | 同上 |
+| dev インクリメンタル（lib を touch） | 9.78 秒 | dev profile、既定 features |
+| バイナリ（既定） | 35,805,032 bytes | release |
+| バイナリ（slim） | 27,267,848 bytes | `--no-default-features`、−23.8% |
+| 起動 → /healthz（standard, 34 engines） | 0.252 秒 | release、RSS 24.7 MiB |
+| アイドル RSS | 24.7 MiB | 起動 5 秒後 |
+| ピーク RSS（1 検索、外部到達不能） | 82,592 kB | `/proc/PID/status` VmHWM |
+
+クリーンな `cargo build`（依存込み・`target` を空から）は時間とディスクの都合で実行していない（NOT_TESTED）。
+上表は依存キャッシュが温まった状態の値で、初回ビルド時間ではない。

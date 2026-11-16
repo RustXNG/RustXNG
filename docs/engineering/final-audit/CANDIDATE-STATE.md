@@ -2,6 +2,24 @@
 
 記録日: 2026-11-17。この文書は監査対象を一意に指すためのスナップショットである。
 
+## チェックポイント（2026-11-17 23:30 更新）
+
+作業ツリーはローカルブランチ `maturation/phase3-5-2026-11-17` に 8 コミットで固定した（**未 push**）。
+各コミットは単独で `cargo check --locked --lib` が通ることを確認済み。
+
+| # | SHA | 内容 |
+| --- | --- | --- |
+| baseline | `f7639ce` | v0.31.2、main |
+| 1 | `72b705f` | style(results): rustfmt |
+| 2 | `3cd66cb` | fix(cache): Valkey 名前空間と SCAN |
+| 3 | `651b758` | feat(observability): ステータスクラスと検索所要時間 |
+| 4 | `9fb4fbd` | security(network): メディア上限・proxy scheme・raw_content clamp |
+| 5 | `57c00bc` | feat(cli): --check-config / warnings / SIGTERM |
+| 6 | `91a8f67` | feat(web): エラー形式・/readyz・各種上限・ブランド |
+| 7 | `b5dc2a5` | test: CLI・抽出コーパス・統合テスト |
+| 8 | `c24beeb` | docs(tools): OpenAPI・評価ツール・依存ポリシー・記録 |
+| candidate | `c24beeb` | 監査対象 |
+
 ## 識別
 
 | 項目 | 値 |

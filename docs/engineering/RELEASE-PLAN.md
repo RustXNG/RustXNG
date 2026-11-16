@@ -26,6 +26,12 @@
 | 12 | tools/*.py | `test(tools): gate benchmarks, OpenAPI, metrics docs and links` |
 | 13 | deny.toml, .github/workflows/* | `ci: check dependency policy, readiness and smoke paths` |
 | 14 | docs/*, README* | `docs: record readiness, evaluation, policy and engineering state` |
+| 15 | src/fetch/*, src/network.rs | `security(network): validate engine clients, redirects and body size` |
+| 16 | src/web/feeds.rs | `fix(web): stop CSV cells from starting a spreadsheet formula` |
+| 17 | src/web/handlers.rs, src/web/image_proxy.rs, src/web/favicons.rs | `fix(web): charge media to the page window and check the limiter first` |
+| 18 | src/diagnostics.rs, src/web/handlers.rs, src/main.rs | `fix(web): readiness follows the index that actually opened` |
+| 19 | src/engine/state.rs, src/settings.rs | `fix(engine): survive a poisoned state lock and bound suspension windows` |
+| 20 | examples/fusion_lab.rs, bench/local-retrieval/fusion-lab/ | `feat(eval): offline rank-fusion lab` |
 
 整形のみの差分（src/results.rs など）は対応するコミットに混ぜず、`style:` として分けるか
 該当コミットの本文に rustfmt と明記する。

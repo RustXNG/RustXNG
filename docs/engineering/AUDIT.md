@@ -51,6 +51,12 @@
 | N19 | P3 | 数式が二重に出る（KaTeX の視覚コピー、MathML の markup と TeX annotation） | 修正済み（重複マークアップを捨て、annotation を優先）+ テスト 3 件 |
 | N20 | P3 | 表の `<caption>` が抽出結果から消える（行だけを走査していた） | 修正済み（キャプションを先頭行に出す）+ テスト 1 件 |
 | N21 | P3 | ページクローム（`nav` / `footer` / `hidden` / `aria-hidden` / `role=navigation`）が本文に混ざる | 修正済み（構造シグナルのみで除去）+ テスト 2 件。実ページ 2 件では本文コンテナが選ばれるため削減量は 0（NOT_MEASURED） |
+| N37 | P2 | `/autocompleter`・画像/ファビコンの limiter が JSON API のバケットを消費し、ページ表示で自分が 429 になっていた（上流は非 HTML のみ加算） | 修正済み（media 3 経路を html バケットへ）。回帰テスト 2 件（順序とバケット分離） |
+| N38 | P2 | `/readyz` が `meta.json` の存在だけで判断し、壊れた索引でも ready=200 を返していた | 修正済み（`Searcher` が実際に開けた索引を渡す）。壊れた索引で 503 のテスト |
+| N39 | P3 | `EngineStates` の `expect` が Mutex poison で全検索を panic させ、suspension 秒に上限が無かった | 修正済み（`unwrap_or_else(into_inner)`、`validate_suspension` で 1 年上限）+ テスト |
+| N40 | P2 | CSV のセルが `=+-@` で始まると表計算ソフトが数式として実行し得た（CWE-1236） | 修正済み（先頭アポストロフィで無害化）+ テスト（コミット済み） |
+| N41 | P2 | engine クライアントが DNS/リダイレクト/本文サイズを検証していなかった | 修正済み（`validated_resolver`、リダイレクト各段検証、8 MiB 上限）。設定済み engine ホストのみ例外 |
+| N42 | P3 | NOTICE に CDLA-Permissive-2.0（webpki-roots）が無く、`/about` に AGPL §13 の source リンクが無かった | 修正済み |
 | N36 | P3 | 文書内の相対リンクが実在するかを検査しておらず、移動・改名で静かに壊れ得た | 修正済み（`tools/test_doc_links.py`: README と docs/** の相対リンクを解決。初回実行で破損 0 件） |
 | N35 | P3 | 有効なまま意図と異なる設定（`max_page = 0`、非ループバックで limiter 無効、metrics 無効、research 有効で鍵なし）を診断する手段がなかった | 修正済み（`Settings::warnings`。`--check-config` の `warnings` と起動時ログに出す）+ 単体・CLI テスト |
 | N34 | P2 | axum がハンドラ前に返す拒否（ボディ超過・クエリ不正）は text/plain で、`format=json` のクライアントだけが JSON を読めなかった | 修正済み（`web::router` のミドルウェアで `format=json` の 400/413/415 を JSON に整形）+ 回帰テスト（413 と `pageno=abc`） |

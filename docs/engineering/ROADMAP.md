@@ -31,7 +31,7 @@
 
 ## Phase 3 — Architecture and Maintainability
 
-- [ ] 責務分離の見直し（既存構成は妥当。大規模分割は利益が未確認のため保留）
+- [ ] 責務分離の見直し（監査で死コード 2 件・循環 3 組・重複 3 件を特定。`results/rank.rs` 分離のみ利益大と判断、実装は次段）
 - [x] 依存削減の計測: slim 構成（`--no-default-features`）は 26,961,784 bytes で既定より 24.0% 小さい（PERFORMANCE.md）
 - [x] API 契約: エラー形式をコードと一致させ、`docs/openapi.yaml` と契約ドリフトテストを追加
 - [x] エンジン契約: 全エンジン × ページ 1/2/1000 のリクエスト構築をテスト（panic・ページ固有の失敗を検出）

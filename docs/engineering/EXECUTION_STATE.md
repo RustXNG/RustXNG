@@ -7,7 +7,7 @@
 ## 現在
 
 - Phase: 1・2 の実装済み項目を検証済み。3 の API 契約、4 の評価基盤、5 の DX まで着手
-- ブランチ: `main`（基点 `f7639ce`）。変更は**未コミットの作業ツリー**（コミットは明示指示があるまで行わない）
+- ブランチ: `maturation/phase3-5-2026-11-17`（基点 `f7639ce`、candidate `c24beeb`、8 コミット、未 push）
 - 次の作業: Phase 4 のルーティング/rank fusion（ライブ検証が要るため BLOCKED 相当）か、索引拡充の検討
 
 ## 完了した項目（累積）
@@ -77,6 +77,13 @@
 - `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test --all-targets`（1178 passed, 4 ignored）
 - Python 86 tests OK、`cargo deny --locked check` すべて ok、markdownlint 0 issues
 - smoke 3/3 PASS（default-port / cli-port / env-port、`/readyz` と MCP stdio を含む）
+
+50. チェックポイント: 8 コミット（`72b705f`…`c24beeb`）をローカルブランチに固定し、各コミットの lib コンパイルを検証
+51. security(network): engine クライアントの DNS/リダイレクト/本文上限（サブエージェント実装をレビューしてコミット `14f6228`）+ CSV 数式注入の無害化（`78eba37`）
+52. fix(web): limiter を検証前に移動、media 3 経路を html バケットへ、`user_info` を trusted-proxy 準拠に（回帰テスト 2 件）
+53. fix(web): `/readyz` は実際に開けた索引で判断（壊れた索引で 503 のテスト）
+54. fix(engine): Mutex poison 耐性と suspension の 1 年上限（テスト 1 件）
+55. Phase 4.3: オフライン融合実験（既存/RRF/正規化和/多様性、ablation と感度）— RRF は有意に悪く不採用、position 融合単独は solo に負けることを実測。ハーネスと再現可能 fixture を `examples/fusion_lab.rs` と `bench/local-retrieval/fusion-lab/` に収録
 
 ## 未完了・追跡
 
