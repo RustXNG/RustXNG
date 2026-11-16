@@ -106,6 +106,8 @@ pub struct Network {
     /// contains a non-global address is refused unless the name is a
     /// configured engine endpoint.
     resolver: Arc<dyn Resolve>,
+    /// Hosts of the enabled engine endpoints (base_url and search_url).
+    engine_hosts: Arc<std::collections::BTreeSet<String>>,
 }
 
 /// Decoded body bytes accepted from one engine response.
@@ -115,26 +117,43 @@ pub struct Network {
 /// the size of its reply. 8 MiB is far above any real search answer.
 const ENGINE_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
-/// Whether an engine redirect may follow from `previous` to `target`.
-///
-/// Staying on the same host is routine for engines (path canonicalisation,
-/// `http` → `https`) and keeps a private endpoint working. Every other target
-/// has to be a public http(s) URL; the engine resolver then refuses a name
-/// whose answer contains a private address.
-fn engine_redirect_allowed(previous: Option<&reqwest::Url>, target: &reqwest::Url) -> bool {
-    // Staying on the same origin is routine canonicalisation and keeps a
-    // private endpoint working. A different port is a different service, so
-    // it is not exempt: an engine on loopback must not be able to redirect
-    // onto another loopback service.
-    let same_origin = previous.is_some_and(|from| {
+/// Whether two URLs are the same origin (scheme, host, effective port).
+fn is_same_origin(previous: Option<&reqwest::Url>, target: &reqwest::Url) -> bool {
+    previous.is_some_and(|from| {
         from.scheme() == target.scheme()
             && from
                 .host_str()
                 .zip(target.host_str())
                 .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
             && from.port_or_known_default() == target.port_or_known_default()
-    });
-    same_origin || crate::fetch::is_fetchable(target)
+    })
+}
+
+/// Whether an engine redirect may follow from `previous` to `target`.
+///
+/// Same-origin hops are routine canonicalisation and keep a private endpoint
+/// working. Everything else has to be public; a proxy hides the real
+/// destination from the local resolver, and another configured engine is a
+/// trusted destination but never a redirect target.
+fn redirect_allowed(
+    previous: Option<&reqwest::Url>,
+    target: &reqwest::Url,
+    through_proxy: bool,
+    engine_hosts: &std::collections::BTreeSet<String>,
+) -> bool {
+    if is_same_origin(previous, target) {
+        return true;
+    }
+    if through_proxy {
+        return false;
+    }
+    let host = target
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase());
+    if host.is_some_and(|host| engine_hosts.contains(&host)) {
+        return false;
+    }
+    crate::fetch::is_fetchable(target)
 }
 
 /// Hand the shared resolver to reqwest, whose builder wants a sized type.
@@ -146,30 +165,58 @@ impl Resolve for SharedResolver {
     }
 }
 
-/// The hosts of the engine endpoints the operator configured.
+/// The hosts of the engine endpoints the operator enabled.
 ///
 /// Those names are trusted configuration: a self-hosted engine may answer
-/// with a private address. Nothing else is exempt from the global-address
-/// rule, including every redirect target.
+/// with a private address. Only enabled engines qualify, and only the host
+/// is kept. Redirects, result URLs, media and MCP reads never consult this
+/// list; a redirect that crosses origins to one of these hosts is refused.
 fn configured_engine_hosts(settings: &Settings) -> Vec<String> {
-    settings
-        .engines
-        .iter()
-        .filter_map(|engine| engine.base_url.as_deref())
-        .filter_map(|base| reqwest::Url::parse(base).ok())
-        .filter_map(|url| url.host_str().map(str::to_string))
-        .collect()
+    let mut hosts: Vec<String> = Vec::new();
+    for engine in settings.enabled_engines() {
+        for template in [engine.base_url.as_deref(), engine.search_url.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            // A template holds placeholders such as {query}; replacing them
+            // keeps the authority intact and lets one parse cover both shapes.
+            let expanded = template
+                .replace("{query}", "x")
+                .replace("{pageno}", "1")
+                .replace("{language}", "en")
+                .replace("{locale}", "en")
+                .replace("{time_range}", "")
+                .replace("{safesearch}", "0");
+            let Ok(url) = reqwest::Url::parse(&expanded) else {
+                continue;
+            };
+            if let Some(host) = url.host_str() {
+                let host = host.trim_end_matches('.').to_ascii_lowercase();
+                if !host.is_empty() && !hosts.iter().any(|known| known == &host) {
+                    hosts.push(host);
+                }
+            }
+        }
+    }
+    hosts
 }
 
-/// The engine client's redirect policy: every hop is checked, like the
-/// direct-only client, instead of trusting the first URL only.
-fn engine_redirect_policy(max_redirects: usize) -> reqwest::redirect::Policy {
+fn engine_redirect_policy(
+    max_redirects: usize,
+    through_proxy: bool,
+    engine_hosts: Arc<std::collections::BTreeSet<String>>,
+) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= max_redirects {
             return attempt.error("too many redirects");
         }
-        if !engine_redirect_allowed(attempt.previous().last(), attempt.url()) {
-            return attempt.error("redirect target is not a public http(s) URL");
+        if !redirect_allowed(
+            attempt.previous().last(),
+            attempt.url(),
+            through_proxy,
+            &engine_hosts,
+        ) {
+            return attempt.error("redirect target is not an allowed destination");
         }
         attempt.follow()
     })
@@ -268,11 +315,14 @@ impl Network {
 
     pub fn from_settings(settings: &Settings) -> Result<Self, NetworkError> {
         let outgoing = &settings.outgoing;
-        let resolver = crate::fetch::validated_resolver(configured_engine_hosts(settings));
+        let hosts = configured_engine_hosts(settings);
+        let resolver = crate::fetch::validated_resolver(hosts.clone());
+        let engine_hosts = Arc::new(hosts.into_iter().collect::<std::collections::BTreeSet<_>>());
+        let through_proxy = !outgoing.proxies.is_empty();
         let client = build_client(
             outgoing,
             None,
-            engine_redirect_policy(outgoing.max_redirects),
+            engine_redirect_policy(outgoing.max_redirects, through_proxy, engine_hosts.clone()),
             Some(resolver.clone()),
         )?;
         let (media_client, media_proxy_blocked) =
@@ -280,6 +330,7 @@ impl Network {
         Ok(Self {
             client,
             resolver,
+            engine_hosts,
             media_client,
             media_proxy_blocked,
             proxied: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -375,7 +426,7 @@ impl Network {
         let client = build_client(
             &self.outgoing,
             Some(configured),
-            engine_redirect_policy(self.outgoing.max_redirects),
+            engine_redirect_policy(self.outgoing.max_redirects, true, self.engine_hosts.clone()),
             Some(self.resolver.clone()),
         )?;
         if let Ok(mut cache) = self.proxied.lock() {
@@ -1574,6 +1625,7 @@ mod tests {
             host_slots: std::sync::Mutex::new(std::collections::HashMap::new()),
             media_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MEDIA)),
             resolver: crate::fetch::validated_resolver(Vec::new()),
+            engine_hosts: Arc::new(std::collections::BTreeSet::new()),
         };
         let first = network.user_agent();
         let second = network.user_agent();
@@ -1999,7 +2051,7 @@ mod tests {
         ] {
             let target = reqwest::Url::parse(target).unwrap();
             assert_eq!(
-                engine_redirect_allowed(Some(&engine), &target),
+                allowed_by_default(Some(&engine), &target),
                 expected,
                 "{target}"
             );
@@ -2008,11 +2060,11 @@ mod tests {
         // on its own origin, but a hop onto another loopback port is another
         // service and is refused.
         let private = reqwest::Url::parse("http://127.0.0.1:8080/api").unwrap();
-        assert!(engine_redirect_allowed(
+        assert!(allowed_by_default(
             Some(&private),
             &reqwest::Url::parse("http://127.0.0.1:8080/api/v2").unwrap()
         ));
-        assert!(!engine_redirect_allowed(
+        assert!(!allowed_by_default(
             Some(&private),
             &reqwest::Url::parse("http://127.0.0.1:9090/admin").unwrap()
         ));
@@ -2073,5 +2125,55 @@ mod tests {
             matches!(result, Err(NetworkError::TooLarge(ENGINE_MAX_BODY_BYTES))),
             "{result:?}"
         );
+    }
+    #[test]
+    fn only_enabled_engine_hosts_are_exempt() {
+        let mut settings = crate::settings::Settings::defaults();
+        let mut primary =
+            crate::settings::EngineConfig::new("self hosted", "json_engine", "sh", &["general"]);
+        primary.base_url = Some("https://Search.Internal./api".into());
+        let mut templated =
+            crate::settings::EngineConfig::new("templated", "json_engine", "tp", &["general"]);
+        templated.search_url = Some("http://engine.lan:8080/search?q={query}&p={pageno}".into());
+        let mut disabled =
+            crate::settings::EngineConfig::new("disabled", "json_engine", "dis", &["general"]);
+        disabled.base_url = Some("http://off.internal/".into());
+        disabled.disabled = Some(true);
+        settings.engines = vec![primary, templated, disabled];
+
+        let hosts = configured_engine_hosts(&settings);
+        assert!(hosts.contains(&"search.internal".to_string()), "{hosts:?}");
+        assert!(hosts.contains(&"engine.lan".to_string()), "{hosts:?}");
+        assert!(
+            !hosts.contains(&"off.internal".to_string()),
+            "disabled engines are not exempt: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn redirects_crossing_origins_are_restricted() {
+        use std::collections::BTreeSet;
+        let engine = reqwest::Url::parse("https://engine.example/search").unwrap();
+        let same = reqwest::Url::parse("https://engine.example/next").unwrap();
+        let public = reqwest::Url::parse("https://other.example/next").unwrap();
+        let trusted = reqwest::Url::parse("http://engine.lan/search").unwrap();
+        let mut hosts = BTreeSet::new();
+        hosts.insert("engine.lan".to_string());
+
+        assert!(redirect_allowed(Some(&engine), &same, false, &hosts));
+        assert!(redirect_allowed(Some(&engine), &public, false, &hosts));
+        assert!(
+            !redirect_allowed(Some(&engine), &public, true, &hosts),
+            "a proxy hides the destination from the resolver"
+        );
+        assert!(
+            !redirect_allowed(Some(&engine), &trusted, false, &hosts),
+            "another configured engine is not a redirect target"
+        );
+    }
+
+    /// The redirect rule with no proxy and no configured engine hosts.
+    fn allowed_by_default(previous: Option<&reqwest::Url>, target: &reqwest::Url) -> bool {
+        redirect_allowed(previous, target, false, &std::collections::BTreeSet::new())
     }
 }
