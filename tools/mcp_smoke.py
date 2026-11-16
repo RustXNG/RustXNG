@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import os
-import select
+import queue
 import subprocess
+import threading
 import time
 
 
@@ -19,17 +20,42 @@ class McpSmokeError(RuntimeError):
     """The MCP session did not behave the way an agent expects."""
 
 
-def _read_response(stream, expected_id, timeout):
+class _LineReader:
+    """Read lines from a pipe without select().
+
+    select() only accepts sockets on Windows, so a pipe there fails with
+    WSAENOTSOCK (10038). A daemon reader thread works on every platform.
+    """
+
+    def __init__(self, stream):
+        self._lines: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._pump, args=(stream,), daemon=True
+        )
+        self._thread.start()
+
+    def _pump(self, stream):
+        try:
+            for line in stream:
+                self._lines.put(line)
+        finally:
+            self._lines.put(None)
+
+    def readline(self, timeout):
+        try:
+            return self._lines.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+def _read_response(reader, expected_id, timeout):
     """Wait for the reply with `expected_id`, skipping notifications."""
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
-        ready, _, _ = select.select([stream], [], [], remaining)
-        if not ready:
-            return None
-        line = stream.readline()
+        line = reader.readline(remaining)
         if not line:
             return None
         message = json.loads(line)
@@ -66,7 +92,8 @@ def run(binary, settings_path, workdir, env, query, known_url):
                     "clientInfo": {"name": "rustxng-smoke", "version": "0"},
                 },
             })
-            init = _read_response(process.stdout, 1, 20.0)
+            reader = _LineReader(process.stdout)
+            init = _read_response(reader, 1, 20.0)
             if not init or "result" not in init:
                 raise McpSmokeError("initialize failed: " + repr(init))
             name = (init["result"].get("serverInfo") or {}).get("name")
@@ -76,7 +103,7 @@ def run(binary, settings_path, workdir, env, query, known_url):
             send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
             send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            listing = _read_response(process.stdout, 2, 20.0)
+            listing = _read_response(reader, 2, 20.0)
             tools = [
                 tool.get("name")
                 for tool in (listing or {}).get("result", {}).get("tools", [])
@@ -93,7 +120,7 @@ def run(binary, settings_path, workdir, env, query, known_url):
                 "method": "tools/call",
                 "params": {"name": "search", "arguments": {"query": query, "limit": 3}},
             })
-            call = _read_response(process.stdout, 3, 30.0)
+            call = _read_response(reader, 3, 30.0)
             result = (call or {}).get("result") or {}
             if result.get("isError"):
                 raise McpSmokeError("search returned an error: " + repr(call)[:400])

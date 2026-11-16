@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,7 @@ class RestartInstanceTests(unittest.TestCase):
             )
         self.assertIn("not found", str(caught.exception))
 
+    @unittest.skipIf(os.name == "nt", "the fixture is a POSIX /bin/true")
     def test_a_missing_fuser_is_reported_not_ignored(self):
         with patch("eval_quality.shutil.which", return_value=None):
             with self.assertRaises(RuntimeError) as caught:
@@ -67,6 +69,7 @@ class RestartInstanceTests(unittest.TestCase):
                 )
         self.assertIn("fuser", str(caught.exception))
 
+    @unittest.skipIf(os.name == "nt", "the fixture is a POSIX /bin/false")
     def test_a_binary_that_exits_is_reported(self):
         # /bin/false exists and exits immediately; fuser is stubbed out so the
         # test never kills a real process.

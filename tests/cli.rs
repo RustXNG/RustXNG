@@ -188,15 +188,25 @@ fn sigterm_stops_the_server_gracefully() {
 
 /// A fake Mwmbl engine that answers only after `delay`.
 #[cfg(unix)]
-fn spawn_delayed_engine(delay: std::time::Duration) -> (String, std::thread::JoinHandle<()>) {
+fn spawn_delayed_engine(
+    delay: std::time::Duration,
+) -> (
+    String,
+    std::sync::mpsc::Receiver<()>,
+    std::thread::JoinHandle<()>,
+) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fake engine");
     let address = listener.local_addr().expect("local address");
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buffer = [0u8; 4096];
             let _ = stream.read(&mut buffer);
+            // The server has the request in flight now; a runner that starts it
+            // slowly must not be raced by the signal below.
+            let _ = accepted_tx.send(());
             std::thread::sleep(delay);
             let body = r#"[{"url":"https://example.com/slow","title":[{"value":"Slow result"}],"extract":[{"value":"Answered after the delay."}]}]"#;
             let _ = write!(
@@ -207,7 +217,7 @@ fn spawn_delayed_engine(delay: std::time::Duration) -> (String, std::thread::Joi
             );
         }
     });
-    (format!("http://{address}/api/v1"), handle)
+    (format!("http://{address}/api/v1"), accepted_rx, handle)
 }
 
 #[cfg(unix)]
@@ -282,7 +292,7 @@ fn sigterm_drains_an_in_flight_request() {
         listener.local_addr().expect("local addr").port()
     };
     let settings = dir.path().join("settings.toml");
-    let (engine_url, engine) = spawn_delayed_engine(Duration::from_millis(800));
+    let (engine_url, accepted, engine) = spawn_delayed_engine(Duration::from_millis(800));
     shutdown_settings(&settings, &engine_url, port, 8);
     let mut child = Command::new(env!("CARGO_BIN_EXE_rustxng"))
         .args(["--config", settings.to_str().expect("utf-8 path")])
@@ -292,7 +302,11 @@ fn sigterm_drains_an_in_flight_request() {
     wait_for_healthz(port);
 
     let search = start_search(port);
-    std::thread::sleep(Duration::from_millis(200));
+    // Signal only once the engine really has the request, so a slow runner
+    // cannot turn "in flight" into "not started yet".
+    accepted
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the engine received the search");
     let status = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
         .status()
@@ -319,7 +333,7 @@ fn sigterm_stops_after_the_shutdown_grace() {
         listener.local_addr().expect("local addr").port()
     };
     let settings = dir.path().join("settings.toml");
-    let (engine_url, engine) = spawn_delayed_engine(Duration::from_secs(10));
+    let (engine_url, accepted, engine) = spawn_delayed_engine(Duration::from_secs(10));
     shutdown_settings(&settings, &engine_url, port, 1);
     let mut child = Command::new(env!("CARGO_BIN_EXE_rustxng"))
         .args(["--config", settings.to_str().expect("utf-8 path")])
@@ -329,7 +343,9 @@ fn sigterm_stops_after_the_shutdown_grace() {
     wait_for_healthz(port);
 
     let _search = start_search(port);
-    std::thread::sleep(Duration::from_millis(300));
+    accepted
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the engine received the search");
     let started = Instant::now();
     let status = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
