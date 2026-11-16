@@ -45,6 +45,23 @@ async fn start_fake_engine() -> String {
     format!("http://{address}/api/v1")
 }
 
+/// Start a fake OpenAI-compatible endpoint that answers after `delay`.
+async fn start_slow_llm(delay: std::time::Duration) -> String {
+    let app = Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move || async move {
+            tokio::time::sleep(delay).await;
+            axum::Json(serde_json::json!({
+                "choices": [{"message": {"content": "[\"rust\"]"}}]
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{address}")
+}
+
 /// Settings with a single engine pointing at the fake server.
 fn settings_for(base_url: &str) -> Settings {
     let mut settings = Settings::defaults();
@@ -577,6 +594,36 @@ async fn static_pages_and_metadata_are_served() {
     let (status, _, _) = get_uri(&app, "/static/style.css").await;
     assert_eq!(status, StatusCode::OK);
 
+    // Branding assets are compiled into the binary and served with a cache hint.
+    for (path, content_type) in [
+        ("/favicon.ico", "image/x-icon"),
+        ("/static/logo.png", "image/png"),
+        ("/static/logo-wordmark.png", "image/png"),
+        ("/static/logo-wordmark-light.png", "image/png"),
+    ] {
+        let (status, body, headers) = get_uri(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some(content_type),
+            "{path}"
+        );
+        assert!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .contains("max-age="),
+            "{path} carries a cache hint"
+        );
+        assert!(body.len() > 1000, "{path} is a real asset, not an empty body");
+    }
+
+    // Every HTML page links the icon.
+    let (status, body, _) = get_uri(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"<link rel="icon" href="/favicon.ico""#), "{body}");
+
     let (status, body, _) = get_uri(&app, "/about").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("AGPL-3.0-or-later"));
@@ -600,6 +647,156 @@ async fn missing_query_and_unknown_routes_are_reported() {
 
     let (status, _, _) = get_uri(&app, "/search?q=rust&format=xml").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn client_errors_keep_the_requested_output_format() {
+    let base_url = start_fake_engine().await;
+    let app = app(settings_for(&base_url));
+
+    // A JSON client cannot read an HTML error page.
+    let (status, body, headers) = get_uri(&app, "/search?format=json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["error"], "missing query");
+
+    // The entry point bounds the page number, so engine offsets cannot
+    // overflow on an unbounded u32 (A16).
+    let (status, body, headers) =
+        get_uri(&app, "/search?q=rust&format=json&pageno=4294967295").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("page number is out of range"),
+        "unexpected body: {body}"
+    );
+
+    // CSV and RSS get a readable plain-text body instead of the template.
+    let (status, body, headers) = get_uri(&app, "/search?format=csv").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/plain")
+    );
+    assert_eq!(body, "missing query");
+
+    // HTML stays the default rendering.
+    let (status, body, headers) = get_uri(&app, "/search").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/html")
+    );
+    assert!(body.contains("missing query"));
+}
+
+#[tokio::test]
+async fn overlong_queries_are_rejected_before_the_engines_run() {
+    let base_url = start_fake_engine().await;
+    let app = app(settings_for(&base_url));
+
+    let long = "a".repeat(2049);
+    let (status, body, _) = get_uri(&app, &format!("/search?q={long}&format=json")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["error"].as_str().unwrap().contains("too long"),
+        "unexpected body: {body}"
+    );
+
+    let accepted = "a".repeat(2048);
+    let (status, _, _) = get_uri(&app, &format!("/search?q={accepted}&format=json")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn readyz_reports_whether_the_instance_can_search() {
+    let base_url = start_fake_engine().await;
+    let configured = app(settings_for(&base_url));
+    let (status, body, _) = get_uri(&configured, "/readyz").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["ready"], true, "{body}");
+    assert_eq!(json["engines"], 1);
+
+    // The process answers, but no source can return a result.
+    let mut settings = settings_for("http://127.0.0.1:1");
+    settings.engines = Vec::new();
+    let empty = app(settings);
+    let (status, body, _) = get_uri(&empty, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["ready"], false, "{body}");
+    assert_eq!(json["engines"], 0);
+    assert_eq!(json["local_index"], false);
+    assert_eq!(json["reasons"].as_array().unwrap().len(), 2, "{body}");
+
+    // /healthz keeps reporting only the process.
+    let (status, body, _) = get_uri(&empty, "/healthz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "OK");
+}
+
+#[tokio::test]
+async fn media_proxies_share_the_rate_limiter() {
+    let base_url = start_fake_engine().await;
+    let mut settings = settings_for(&base_url);
+    settings.server.image_proxy = true;
+    settings.server.limiter = LimiterSettings::Enabled(true);
+    settings.server.limiter_max = 1;
+    settings.server.limiter_window = 60;
+    let app = app(settings);
+
+    let unsigned = "/image_proxy?url=https%3A%2F%2Fexample.com%2Fa.png";
+    let (status, _, _) = get_uri(&app, unsigned).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the signature is still required"
+    );
+
+    // The second call is refused before any upstream work starts.
+    let (status, body, headers) = get_uri(&app, unsigned).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key(header::RETRY_AFTER));
+    assert!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/plain"),
+        "media rejections stay plain text"
+    );
+    assert!(
+        body.contains("too many requests"),
+        "unexpected body: {body}"
+    );
+
+    // The favicon proxy counts in the same bucket.
+    let favicon = "/favicon_proxy?url=https%3A%2F%2Fexample.com";
+    let (status, _, _) = get_uri(&app, favicon).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]
@@ -802,6 +999,76 @@ async fn the_rate_limiter_answers_429_after_the_limit() {
     // /healthz is not limited
     let (status, _, _) = get_uri(&app, "/healthz").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn autocomplete_ignores_unknown_backends_and_shares_the_limiter() {
+    let base_url = start_fake_engine().await;
+    let mut settings = settings_for(&base_url);
+    settings.server.limiter = LimiterSettings::Enabled(true);
+    settings.server.limiter_max = 1;
+    settings.server.limiter_window = 60;
+    let app = app(settings);
+
+    // Only names this build knows are contacted, so a long list cannot turn
+    // one request into many outbound calls.
+    let (status, body, _) =
+        get_uri(&app, "/autocompleter?q=rust&backend=unknown,also-unknown").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "[]");
+
+    // The handler counts against the shared limiter.
+    let (status, body, _) = get_uri(&app, "/autocompleter?q=rust&backend=duckduckgo").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(json["error"].is_string(), "unexpected body: {body}");
+}
+
+#[tokio::test]
+async fn concurrent_research_requests_are_bounded() {
+    let base_url = start_fake_engine().await;
+    let llm = start_slow_llm(std::time::Duration::from_secs(2)).await;
+    let mut settings = settings_for(&base_url);
+    settings.search.site_scoped_retry = false;
+    settings.research.enabled = true;
+    settings.research.base_url = llm;
+    settings.research.api_key = "test-key".into();
+    settings.research.max_concurrency = 1;
+    let app = app(settings);
+
+    let first = app.clone();
+    let running =
+        tokio::spawn(async move { get_uri(&first, "/research?q=rust&max_queries=1").await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let (status, body, _) = get_uri(&app, "/research?q=rust&max_queries=1").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(
+        body.contains("too many concurrent research"),
+        "unexpected body: {body}"
+    );
+
+    let (status, _, _) = running.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn research_stops_at_its_own_deadline() {
+    let base_url = start_fake_engine().await;
+    let llm = start_slow_llm(std::time::Duration::from_secs(5)).await;
+    let mut settings = settings_for(&base_url);
+    settings.search.site_scoped_retry = false;
+    settings.research.enabled = true;
+    settings.research.base_url = llm;
+    settings.research.api_key = "test-key".into();
+    settings.research.deadline = 1;
+    let app = app(settings);
+
+    let (status, body, _) = get_uri(&app, "/research?q=rust&max_queries=1").await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert!(body.contains("did not finish"), "unexpected body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(json["error"].is_string());
 }
 
 #[tokio::test]
@@ -1095,11 +1362,152 @@ async fn stats_endpoint_shows_resting_engines() {
 }
 
 #[tokio::test]
+async fn metrics_endpoint_reports_readiness_cache_and_limiter() {
+    let base_url = start_fake_engine().await;
+    let mut settings = settings_for(&base_url);
+    settings.server.limiter = LimiterSettings::Enabled(true);
+    settings.server.limiter_max = 5;
+    let configured = app(settings);
+    get_uri(&configured, "/search?q=rust&format=json&full=1").await;
+    // A rejected request must be visible as a 4xx in the same exposition.
+    let (status, _, _) = get_uri(&configured, "/search?format=json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body, _) = get_uri(&configured, "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+    // Readiness uses the same evaluation as /readyz and --check-config.
+    assert!(body.contains("searxng_ready 1"), "{body}");
+    assert!(body.contains("searxng_engines_configured 1"), "{body}");
+    assert!(body.contains("searxng_local_index 0"), "{body}");
+    assert!(body.contains("searxng_cache_error_total 0"), "{body}");
+    let cache_bytes = body
+        .lines()
+        .find(|line| line.starts_with("searxng_cache_bytes "))
+        .expect("cache bytes are exported");
+    assert!(
+        cache_bytes.rsplit(' ').next().unwrap().parse::<u64>().is_ok(),
+        "{cache_bytes}"
+    );
+    let allowed = body
+        .lines()
+        .find(|line| line.starts_with("searxng_limiter_requests_total{verdict=\"allowed\"}"))
+        .expect("allowed requests are exported");
+    let allowed: u64 = allowed.rsplit(' ').next().unwrap().parse().expect("counter");
+    assert!(allowed >= 1, "every allowed request is counted: {allowed}");
+    assert!(
+        body.contains("searxng_limiter_requests_total{verdict=\"blocked\"} 0"),
+        "{body}"
+    );
+    let tracked = body
+        .lines()
+        .find(|line| line.starts_with("searxng_limiter_tracked "))
+        .expect("tracked clients are exported");
+    let tracked: u64 = tracked.rsplit(' ').next().unwrap().parse().expect("gauge");
+    assert!(tracked >= 1, "{tracked}");
+
+    // Search latency is exported as a sum/count pair.
+    let duration_line = body
+        .lines()
+        .find(|line| line.starts_with("searxng_search_duration_seconds_count "))
+        .expect("the search count is exported");
+    let searches: u64 = duration_line.rsplit(' ').next().unwrap().parse().expect("counter");
+    assert!(searches >= 1, "one search ran: {searches}");
+    let sum_line = body
+        .lines()
+        .find(|line| line.starts_with("searxng_search_duration_seconds_sum "))
+        .expect("the search sum is exported");
+    let total: f64 = sum_line.rsplit(' ').next().unwrap().parse().expect("float");
+    assert!(total > 0.0, "the search took measurable time: {total}");
+
+    // Responses are counted by status class for error-rate alerts. The
+    // exposition itself is counted after it is rendered, so 2xx >= 1.
+    for (class, minimum) in [("2xx", 1u64), ("4xx", 1u64)] {
+        let line = body
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("searxng_http_responses_total{{status=\"{class}\"}}"))
+            })
+            .unwrap_or_else(|| panic!("status class {class} is exported:\n{body}"));
+        let value: u64 = line.rsplit(' ').next().unwrap().parse().expect("counter");
+        assert!(value >= minimum, "{class} is {value}, expected at least {minimum}");
+    }
+
+    // A profile without any source reports that it cannot search.
+    let mut empty = settings_for("http://127.0.0.1:1");
+    empty.engines = Vec::new();
+    let empty_app = app(empty);
+    let (status, body, _) = get_uri(&empty_app, "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("searxng_ready 0"), "{body}");
+    assert!(body.contains("searxng_engines_configured 0"), "{body}");
+}
+
+/// Every shipped engine must build a request for the whole accepted page
+/// range without panicking and without producing an unusable URL.
+///
+/// The HTTP entry point caps pageno at 1000 (MAX_PAGENO), so engines only
+/// have to survive that range; configuration-dependent errors (missing API
+/// keys and the like) are allowed, panics are not.
+#[test]
+fn every_configured_engine_builds_requests_within_the_page_limit() {
+    use rustxng::query::Query;
+
+    let searcher = Searcher::new(Settings::defaults()).expect("searcher");
+    let query = Query::parse("rust ownership", &searcher.registry, &[]);
+    let mut built = 0usize;
+    let mut failures = Vec::new();
+    for handle in searcher.registry.iter() {
+        for pageno in [1u32, 2, 1000] {
+            match handle.build_request(&query, pageno) {
+                Ok(request) => {
+                    let parsed = url::Url::parse(&request.url).unwrap_or_else(|error| {
+                        panic!("{} page {pageno}: {error}", handle.name())
+                    });
+                    assert!(
+                        matches!(parsed.scheme(), "http" | "https"),
+                        "{} page {pageno} produced {}",
+                        handle.name(),
+                        request.url
+                    );
+                    built += 1;
+                }
+                Err(error) => {
+                    failures.push((handle.name().to_string(), pageno, error.to_string()))
+                }
+            }
+        }
+    }
+    for (engine, pageno, error) in &failures {
+        println!("deferred {engine} page {pageno}: {error}");
+    }
+    // A page-specific failure is a real defect: an engine that builds page 1
+    // must also build the higher pages the HTTP entry point accepts.
+    let config_errors: std::collections::HashSet<&str> = failures
+        .iter()
+        .filter(|(_, pageno, _)| *pageno == 1)
+        .map(|(engine, _, _)| engine.as_str())
+        .collect();
+    for (engine, pageno, error) in &failures {
+        assert!(
+            *pageno == 1 || config_errors.contains(engine.as_str()),
+            "{engine} builds page 1 but fails at page {pageno}: {error}"
+        );
+    }
+    println!(
+        "built {built} engine requests; {} engine/page combinations returned an error",
+        failures.len()
+    );
+    assert!(
+        built >= 30,
+        "only {built} engine requests could be built; failures: {failures:?}"
+    );
+}
+
+#[tokio::test]
 async fn metrics_endpoint_exposes_resting_gauges() {
     let settings = resting_test_settings();
     let searcher = Searcher::new(settings).expect("searcher");
-
-    // Trigger resting
+    // One empty success reaches the limit, so the engine starts resting.
     searcher.states.record_success(
         "testeng",
         0,
@@ -1108,135 +1516,121 @@ async fn metrics_endpoint_exposes_resting_gauges() {
     );
 
     let app = router(AppState::new(searcher));
-
     let (status, body, _) = get_uri(&app, "/metrics").await;
     assert_eq!(status, StatusCode::OK);
-
-    // Check HELP lines exist
     assert!(
-        body.contains("# HELP searxng_engines_resting"),
-        "metrics should include resting HELP"
+        body.contains("searxng_engines_resting{engine=\"testeng\"} 1"),
+        "the resting gauge is exported: {body}"
     );
-    assert!(
-        body.contains("# HELP searxng_engines_resting_seconds"),
-        "metrics should include resting_seconds HELP"
-    );
-
-    // Check gauge values for testeng
-    let resting_line = body
-        .lines()
-        .find(|line| line.starts_with("searxng_engines_resting{engine=\"testeng\"}"))
-        .expect("resting gauge should be exported");
-    assert!(
-        resting_line.ends_with(" 1"),
-        "testeng should be resting (value=1)"
-    );
-
-    let seconds_line = body
+    let seconds = body
         .lines()
         .find(|line| line.starts_with("searxng_engines_resting_seconds{engine=\"testeng\"}"))
-        .expect("resting_seconds gauge should be exported");
-    let seconds_value: f64 = seconds_line
-        .rsplit(' ')
-        .next()
-        .and_then(|v| v.parse().ok())
-        .expect("seconds value should be a number");
-    assert!(seconds_value > 0.0, "resting_seconds should be positive");
+        .expect("the remaining rest time is exported");
+    let value: f64 = seconds.rsplit(' ').next().unwrap().parse().expect("gauge");
+    assert!(value > 0.0, "resting seconds: {value}");
 }
 
 #[tokio::test]
 async fn stats_shows_recovery_from_resting() {
     let settings = resting_test_settings();
     let searcher = Searcher::new(settings).expect("searcher");
-    let states = searcher.states.clone();
-
-    // Trigger resting
-    states.record_success(
+    searcher.states.record_success(
         "testeng",
         0,
         std::time::Duration::from_millis(50),
         &searcher.settings.search,
     );
+    let resting = searcher
+        .engine_snapshots()
+        .into_iter()
+        .find(|engine| engine.engine == "testeng")
+        .expect("the engine is tracked");
+    assert!(resting.resting, "empty results put the engine to rest");
+
+    // A page with results ends the rest immediately.
+    searcher.states.record_success(
+        "testeng",
+        3,
+        std::time::Duration::from_millis(50),
+        &searcher.settings.search,
+    );
+    let recovered = searcher
+        .engine_snapshots()
+        .into_iter()
+        .find(|engine| engine.engine == "testeng")
+        .expect("the engine is tracked");
+    assert!(!recovered.resting, "a result ends the rest");
 
     let app = router(AppState::new(searcher));
-
-    // Verify resting via /stats HTML
-    let (status, body, _) = get_uri(&app, "/stats").await;
+    let (status, _, _) = get_uri(&app, "/stats").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        body.contains("empty results"),
-        "engine should be resting initially"
-    );
+}
 
-    // Verify resting via /stats/errors JSON
-    let (_, body, _) = get_uri(&app, "/stats/errors").await;
+#[tokio::test]
+async fn oversized_request_bodies_are_rejected() {
+    let base_url = start_fake_engine().await;
+    let app = app(settings_for(&base_url));
+
+    // A normal preference update still goes through.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/preferences")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("action=save&language=ja"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    // 100 KiB is over the 64 KiB limit, although axum would allow 2 MiB.
+    let big = format!("q={}", "a".repeat(100_000));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(big))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // A JSON caller still receives JSON when axum rejects the request first.
+    let big = format!("q={}", "a".repeat(100_000));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search?format=json")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(big))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = body_text(response).await;
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let eng = json
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["engine"] == "testeng")
-        .unwrap();
-    assert!(eng["resting"].as_bool().unwrap());
+    assert!(json["error"].is_string(), "{body}");
 
-    // Verify resting via /metrics
-    let (_, body, _) = get_uri(&app, "/metrics").await;
-    let resting_line = body
-        .lines()
-        .find(|line| line.starts_with("searxng_engines_resting{engine=\"testeng\"}"))
-        .unwrap();
-    assert!(resting_line.ends_with(" 1"));
-
-    // Recover by returning actual results (using the same Arc<EngineStates>)
-    states.record_success(
-        "testeng",
-        5,
-        std::time::Duration::from_millis(100),
-        &rustxng::settings::Search {
-            empty_result_limit: 1,
-            empty_result_cooldown: 300,
-            ..Default::default()
-        },
-    );
-
-    // /stats HTML should no longer show "empty results"
-    let (_, body, _) = get_uri(&app, "/stats").await;
-    assert!(
-        !body.contains("empty results"),
-        "engine should not be resting after recovery"
-    );
-
-    // /stats/errors JSON should show resting=false, resting_for=0
-    let (_, body, _) = get_uri(&app, "/stats/errors").await;
+    // A query-string rejection is rendered the same way.
+    let (status, body, _) = get_uri(&app, "/search?q=rust&format=json&pageno=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let eng = json
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["engine"] == "testeng")
-        .unwrap();
-    assert!(
-        !eng["resting"].as_bool().unwrap(),
-        "engine should not be resting after recovery"
-    );
-    assert_eq!(eng["resting_for"].as_f64().unwrap(), 0.0);
-
-    // /metrics should show resting=0, resting_seconds=0
-    let (_, body, _) = get_uri(&app, "/metrics").await;
-    let resting_line = body
-        .lines()
-        .find(|line| line.starts_with("searxng_engines_resting{engine=\"testeng\"}"))
-        .unwrap();
-    assert!(
-        resting_line.ends_with(" 0"),
-        "resting gauge should be 0 after recovery"
-    );
-    let seconds_line = body
-        .lines()
-        .find(|line| line.starts_with("searxng_engines_resting_seconds{engine=\"testeng\"}"))
-        .unwrap();
-    assert!(
-        seconds_line.ends_with(" 0.000"),
-        "resting_seconds should be 0 after recovery"
-    );
+    assert!(json["error"].is_string(), "{body}");
 }

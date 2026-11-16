@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "note": "Offline extraction corpus: every page states what the reader must keep and what must stay out. No network is used.",
+  "files": [
+    {
+      "file": "docs-page.html",
+      "must_contain": [
+        "Table 1: Flags",
+        "| Flag | Meaning |",
+        "| --- | --- |",
+        "| --dry-run | Report the plan without writing |",
+        "The index writer commits at the end of the run.",
+        "cargo run --release --example local_quality",
+        "left untouched only after a successful run [1]."
+      ],
+      "must_not_contain": [
+        "Documentation",
+        "Copyright 2026 Example"
+      ],
+      "min_chars": 200
+    },
+    {
+      "file": "math-page.html",
+      "must_contain": [
+        "e^{i\\pi} + 1 = 0",
+        "a+b",
+        "special case"
+      ],
+      "must_not_contain": [
+        "iπ",
+        "Share this article"
+      ],
+      "min_chars": 120
+    },
+    {
+      "file": "ja-docs.html",
+      "must_contain": [
+        "| 項目 | 既定値 |",
+        "| workers | 8 |",
+        "同時に取得するページ数です。",
+        "rustxng-index crawl --seed https://docs.python.org/3/"
+      ],
+      "must_not_contain": [
+        "ホーム",
+        "© 2026 Example"
+      ],
+      "min_chars": 120
+    },
+    {
+      "file": "rfc-page.html",
+      "must_contain": [
+        "| RFC 9999 | Example Protocol | November 2026 |",
+        "1. Introduction",
+        "Implementations MUST send the header before the body."
+      ],
+      "must_not_contain": [],
+      "min_chars": 150
+    },
+    {
+      "file": "news-page.html",
+      "must_contain": [
+        "The release notes list the new lints",
+        "By A. Writer",
+        "Related: earlier release notes."
+      ],
+      "must_not_contain": [
+        "Subscribe to our newsletter!",
+        "About · Contact",
+        "Example News"
+      ],
+      "min_chars": 120
+    }
+  ]
+}
