@@ -35,9 +35,26 @@ fn check_config_reports_the_clean_profile_readiness() {
         "warnings are part of the report: {json}"
     );
     assert_eq!(json["engines"], 0);
-    // The repository ships the two indexes next to Cargo.toml, and the test runs there.
-    assert_eq!(json["local_index"], true, "{json}");
-    assert_eq!(json["ready"], true, "{json}");
+    // The two indexes are local build artefacts and are gitignored, so a clean
+    // checkout has none and a developer checkout may have both. With no engine
+    // enabled the index alone decides readiness, which keeps this assertion
+    // true either way.
+    let local_index = json["local_index"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("local_index is a boolean: {json}"));
+    assert_eq!(
+        json["ready"].as_bool(),
+        Some(local_index),
+        "an opened index is the only source: {json}"
+    );
+    if !local_index {
+        assert!(
+            json["reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason == "no local index is available")),
+            "the missing index is explained: {json}"
+        );
+    }
 }
 
 #[test]
