@@ -50,6 +50,17 @@ pub fn upstream_json(response: &SearchResponse) -> serde_json::Value {
                     object["raw_content_truncated"] = serde_json::json!(truncated);
                 }
             }
+            // 蒸留（上流超え）: 転載統合と関連性スコア。
+            // SearXNG の JSON には無い項目。値があるときだけ出す。
+            if let Some(rel) = result.relevance_score {
+                object["relevance_score"] = serde_json::json!(rel);
+            }
+            if !result.merged_sources.is_empty() {
+                object["merged_sources"] = serde_json::json!(result.merged_sources);
+            }
+            if let Some(family) = &result.source_family {
+                object["source_family"] = serde_json::json!(family);
+            }
             object
         })
         .collect();
