@@ -369,6 +369,12 @@ impl Cache {
     }
 }
 
+/// Namespace of the response-cache keys in Valkey / Redis.
+///
+/// Entries written before this prefix existed keep their own TTL and are not
+/// shared with a namespaced instance.
+const VALKEY_KEY_PREFIX: &str = "rustxng:cache:";
+
 /// A cache stored in Valkey / Redis, like the upstream valkey cache backend.
 pub struct ValkeyCache {
     url: String,
@@ -393,7 +399,7 @@ impl ValkeyCache {
         }
     }
 
-    async fn command(&self, args: &[&str]) -> Result<Option<String>, String> {
+    async fn raw_command(&self, args: &[&str]) -> Result<ValkeyReply, String> {
         let mut pooled = self.connection.lock().await;
         // Cancellation must discard the connection.
         let mut connection = match pooled.take() {
@@ -407,8 +413,20 @@ impl ValkeyCache {
         response
     }
 
+    async fn command(&self, args: &[&str]) -> Result<Option<String>, String> {
+        Ok(flatten_reply(self.raw_command(args).await?))
+    }
+
+    /// Prefix of every key this backend owns. `clear` scans only this
+    /// namespace, so a shared Valkey database keeps the entries of other
+    /// applications and of older RustXNG versions intact.
+    fn namespaced(key: &str) -> String {
+        format!("{VALKEY_KEY_PREFIX}{key}")
+    }
+
     pub async fn get(&self, key: &str) -> Option<CachedResponse> {
-        match self.command(&["GET", key]).await {
+        let key = Self::namespaced(key);
+        match self.command(&["GET", &key]).await {
             Ok(Some(payload)) => match decode_response(&payload) {
                 Some(response) => {
                     self.hit.fetch_add(1, Ordering::Relaxed);
@@ -438,7 +456,8 @@ impl ValkeyCache {
             return;
         };
         let ttl = self.ttl.as_secs().max(1).to_string();
-        match self.command(&["SET", key, &payload, "EX", &ttl]).await {
+        let key = Self::namespaced(key);
+        match self.command(&["SET", &key, &payload, "EX", &ttl]).await {
             Ok(_) => {
                 self.entries.fetch_add(1, Ordering::Relaxed);
             }
@@ -452,7 +471,8 @@ impl ValkeyCache {
     /// server side and drops expired values, so this matches `get` without
     /// touching the hit/miss counters.
     pub async fn get_with_stale(&self, key: &str) -> Option<CachedResponse> {
-        match self.command(&["GET", key]).await {
+        let key = Self::namespaced(key);
+        match self.command(&["GET", &key]).await {
             Ok(Some(payload)) => decode_response(&payload),
             _ => None,
         }
@@ -461,18 +481,55 @@ impl ValkeyCache {
     /// Extend the TTL of an existing entry after a 304 revalidation.
     pub async fn refresh(&self, key: &str) -> bool {
         let ttl = self.ttl.as_secs().max(1).to_string();
+        let key = Self::namespaced(key);
         matches!(
-            self.command(&["EXPIRE", key, &ttl]).await,
+            self.command(&["EXPIRE", &key, &ttl]).await,
             Ok(Some(reply)) if reply == "1"
         )
     }
 
+    /// Drop every entry of this namespace.
+    ///
+    /// Uses `SCAN` instead of `KEYS`: a large shared database must not be
+    /// blocked server side by one administrative call.
     pub async fn clear(&self) {
-        if let Ok(Some(keys)) = self.command(&["KEYS", "searxng:*"]).await {
-            for key in keys.split('\n') {
-                if !key.is_empty() {
-                    let _ = self.command(&["DEL", key]).await;
+        let pattern = format!("{VALKEY_KEY_PREFIX}*");
+        let mut cursor = "0".to_string();
+        loop {
+            let reply = match self
+                .raw_command(&["SCAN", &cursor, "MATCH", &pattern, "COUNT", "256"])
+                .await
+            {
+                Ok(reply) => reply,
+                Err(_) => return,
+            };
+            let ValkeyReply::Array(items) = reply else {
+                return;
+            };
+            let mut items = items.into_iter();
+            cursor = match items.next() {
+                Some(ValkeyReply::Bulk(Some(value))) | Some(ValkeyReply::Simple(value)) => value,
+                _ => return,
+            };
+            let keys: Vec<String> = match items.next() {
+                Some(ValkeyReply::Array(keys)) => keys
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        ValkeyReply::Bulk(Some(value)) | ValkeyReply::Simple(value) => Some(value),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !keys.is_empty() {
+                let mut args = vec!["DEL"];
+                args.extend(keys.iter().map(String::as_str));
+                if self.raw_command(&args).await.is_err() {
+                    return;
                 }
+            }
+            if cursor == "0" {
+                return;
             }
         }
     }
@@ -580,8 +637,8 @@ impl ValkeyConnection {
         Ok(connection)
     }
 
-    /// Run one command; bulk replies come back as Some(String), nil as None.
-    async fn command(&mut self, args: &[&str]) -> Result<Option<String>, String> {
+    /// Run one command and return its raw reply.
+    async fn command(&mut self, args: &[&str]) -> Result<ValkeyReply, String> {
         use tokio::io::AsyncWriteExt as _;
         let mut request = format!("*{}\r\n", args.len());
         for argument in args {
@@ -595,22 +652,7 @@ impl ValkeyConnection {
             .flush()
             .await
             .map_err(|error| error.to_string())?;
-        match self.read_reply().await? {
-            ValkeyReply::Bulk(value) => Ok(value),
-            ValkeyReply::Simple(value) => Ok(Some(value)),
-            ValkeyReply::Integer(value) => Ok(Some(value.to_string())),
-            ValkeyReply::Nil => Ok(None),
-            ValkeyReply::Array(items) => Ok(Some(
-                items
-                    .into_iter()
-                    .filter_map(|item| match item {
-                        ValkeyReply::Bulk(Some(value)) | ValkeyReply::Simple(value) => Some(value),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )),
-        }
+        self.read_reply().await
     }
 
     fn read_reply(
@@ -671,6 +713,29 @@ enum ValkeyReply {
     Nil,
 }
 
+/// Collapse a reply to the textual form the cache treats as a value.
+///
+/// Multibulk replies (the `*` array form) join their scalar items with a
+/// newline, which is what the key listing helpers expect.
+fn flatten_reply(reply: ValkeyReply) -> Option<String> {
+    match reply {
+        ValkeyReply::Bulk(value) => value,
+        ValkeyReply::Simple(value) => Some(value),
+        ValkeyReply::Integer(value) => Some(value.to_string()),
+        ValkeyReply::Nil => None,
+        ValkeyReply::Array(items) => Some(
+            items
+                .into_iter()
+                .filter_map(|item| match item {
+                    ValkeyReply::Bulk(Some(value)) | ValkeyReply::Simple(value) => Some(value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod valkey_tests {
     use super::*;
@@ -702,7 +767,10 @@ mod valkey_tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut first = tokio::io::BufReader::new(stream);
-            assert_eq!(read_command(&mut first).await, ["GET", "first"]);
+            assert_eq!(
+                read_command(&mut first).await,
+                ["GET", "rustxng:cache:first"]
+            );
             requested.send(()).unwrap();
             cancelled.await.unwrap();
             let payload =
@@ -714,7 +782,10 @@ mod valkey_tests {
 
             let (stream, _) = listener.accept().await.unwrap();
             let mut second = tokio::io::BufReader::new(stream);
-            assert_eq!(read_command(&mut second).await, ["GET", "second"]);
+            assert_eq!(
+                read_command(&mut second).await,
+                ["GET", "rustxng:cache:second"]
+            );
             let payload =
                 r#"{"status":200,"final_url":"https://second.invalid/","body":"c2Vjb25k"}"#;
             second
@@ -838,8 +909,7 @@ mod valkey_tests {
     #[test]
     fn payloads_without_validators_decode_for_compatibility() {
         // A payload written before the validators were stored.
-        let payload =
-            r#"{"status":200,"final_url":"https://example.test/","body":"aGVsbG8="}"#;
+        let payload = r#"{"status":200,"final_url":"https://example.test/","body":"aGVsbG8="}"#;
         let decoded = decode_response(payload).expect("decode");
         assert_eq!(decoded.body.as_slice(), b"hello");
         assert!(decoded.etag.is_none());
@@ -853,7 +923,10 @@ mod valkey_tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut stream = tokio::io::BufReader::new(stream);
-            assert_eq!(read_command(&mut stream).await, ["GET", "key"]);
+            assert_eq!(
+                read_command(&mut stream).await,
+                ["GET", "rustxng:cache:key"]
+            );
             let payload = r#"{"status":200,"final_url":"https://example.test/","body":"aGVsbG8=","etag":"\"v1\""}"#;
             stream
                 .get_mut()
@@ -871,17 +944,59 @@ mod valkey_tests {
     }
 
     #[tokio::test]
+    async fn clear_scans_the_whole_namespace_and_deletes_each_page() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            // First page: the server returns a non-zero cursor, so the
+            // client has to keep scanning.
+            assert_eq!(
+                read_command(&mut stream).await,
+                ["SCAN", "0", "MATCH", "rustxng:cache:*", "COUNT", "256"]
+            );
+            stream
+                .get_mut()
+                .write_all(b"*2\r\n$1\r\n7\r\n*1\r\n$15\r\nrustxng:cache:a\r\n")
+                .await
+                .unwrap();
+            assert_eq!(read_command(&mut stream).await, ["DEL", "rustxng:cache:a"]);
+            stream.get_mut().write_all(b":1\r\n").await.unwrap();
+            assert_eq!(
+                read_command(&mut stream).await,
+                ["SCAN", "7", "MATCH", "rustxng:cache:*", "COUNT", "256"]
+            );
+            stream
+                .get_mut()
+                .write_all(b"*2\r\n$1\r\n0\r\n*1\r\n$15\r\nrustxng:cache:b\r\n")
+                .await
+                .unwrap();
+            assert_eq!(read_command(&mut stream).await, ["DEL", "rustxng:cache:b"]);
+            stream.get_mut().write_all(b":1\r\n").await.unwrap();
+        });
+        let cache = Cache::valkey(&url, Duration::from_secs(60));
+        tokio::time::timeout(Duration::from_secs(2), cache.clear())
+            .await
+            .expect("clear must finish once the cursor returns to zero");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn refresh_extends_the_valkey_ttl() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("redis://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut stream = tokio::io::BufReader::new(stream);
-            assert_eq!(read_command(&mut stream).await, ["EXPIRE", "key", "60"]);
+            assert_eq!(
+                read_command(&mut stream).await,
+                ["EXPIRE", "rustxng:cache:key", "60"]
+            );
             stream.get_mut().write_all(b":1\r\n").await.unwrap();
             assert_eq!(
                 read_command(&mut stream).await,
-                ["EXPIRE", "missing", "60"]
+                ["EXPIRE", "rustxng:cache:missing", "60"]
             );
             stream.get_mut().write_all(b":0\r\n").await.unwrap();
         });
