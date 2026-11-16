@@ -614,6 +614,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn order_results_keeps_one_category_together() {
+        // Upstream get_ordered_results: results of one category are spread with
+        // at most eight neighbours between them, and nothing is dropped.
+        let mut results = Vec::new();
+        for index in 0..4 {
+            let mut image = SearchResult::new(format!("https://img.example.com/{index}"), "img");
+            image.category = "images".into();
+            image.template = super::super::Template::Images;
+            image.score = 1.0;
+            results.push(image);
+            let mut web = SearchResult::new(format!("https://web.example.com/{index}"), "web");
+            web.category = "general".into();
+            web.score = 10.0 - index as f64;
+            results.push(web);
+        }
+        let ordered = order_results(&results);
+        assert_eq!(ordered.len(), results.len());
+        // The higher scored web results keep their order at the front ...
+        assert_eq!(
+            ordered[..4]
+                .iter()
+                .map(|r| r.url.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "https://web.example.com/0",
+                "https://web.example.com/1",
+                "https://web.example.com/2",
+                "https://web.example.com/3",
+            ]
+        );
+        // ... and the lower scored image group follows as one block.
+        assert!(
+            ordered[4..]
+                .iter()
+                .all(|r| r.url.contains("img.example.com"))
+        );
+    }
+
+    #[test]
     fn page_languages_are_read_from_urls() {
         assert_eq!(
             page_language("https://docs.python.org/ja/3/library/"),
