@@ -52,6 +52,7 @@ respective crate repositories.
 Third-party crates
 ------------------
   Dependencies are permissive (MIT / Apache-2.0 / BSD / ISC / Zlib / Unicode).
+  `webpki-roots` ships certificate data under CDLA-Permissive-2.0.
   Four transitive crates from the HTML/CSS stack are MPL-2.0 (file-level
   copyleft, compatible with AGPL-3.0-or-later):
 
