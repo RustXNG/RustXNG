@@ -3,6 +3,27 @@
 
 このファイルの形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に従います。バージョニング方針は本文末尾の「セマンティックバージョニング」を参照してください。
 
+## [0.32.0](https://github.com/RustXNG/RustXNG/compare/v0.31.2...v0.32.0) (2026-11-16)
+
+
+### Features
+
+* **cli:** add --check-config with readiness and warnings ([57c00bc](https://github.com/RustXNG/RustXNG/commit/57c00bc934bf1179033aa0f91b3920c75d1ff178))
+* **eval:** offline rank-fusion lab ([4e0cd68](https://github.com/RustXNG/RustXNG/commit/4e0cd688d834ec33e14b439327a11a7b3b45867a))
+* **network:** conditional GET revalidation and Retry-After support ([09b4e4c](https://github.com/RustXNG/RustXNG/commit/09b4e4c889133f2753392f5486e4df60063a0907))
+* **observability:** count response classes and search duration ([651b758](https://github.com/RustXNG/RustXNG/commit/651b75847021aa559df894d14e03bda5a04e18d6))
+* **results:** distillation — merge transfers and expose relevance (upstream-exceeding) ([f7639ce](https://github.com/RustXNG/RustXNG/commit/f7639cede00634a48db3261709bc359752f109eb))
+* **server:** bound the shutdown drain with shutdown_grace ([71388da](https://github.com/RustXNG/RustXNG/commit/71388da6a6199c2cddb535691c0955220aa568cd))
+* **web:** request-format errors, /readyz, limits and branding ([91a8f67](https://github.com/RustXNG/RustXNG/commit/91a8f67feeb3c435731a29fbb25eae931aa04d9c))
+
+
+### Bug Fixes
+
+* **cache:** namespace Valkey keys and clear them with SCAN ([3cd66cb](https://github.com/RustXNG/RustXNG/commit/3cd66cbfc84c8d24bc44bad06ad212c5d5f184fd))
+* **engine:** survive a poisoned state lock and bound suspension windows ([e6181cb](https://github.com/RustXNG/RustXNG/commit/e6181cb1947c322508f4df6e86630f3542597e9b))
+* **web:** charge media to the page window and check the limiter first ([a69f961](https://github.com/RustXNG/RustXNG/commit/a69f961f535c3fe1785a6ff6b5439771cc0ef554))
+* **web:** stop CSV cells from starting a spreadsheet formula ([78eba37](https://github.com/RustXNG/RustXNG/commit/78eba37fcf3b43e46e054ab26df40b73d049d073))
+
 ## [0.31.2](https://github.com/sahenjp/RustXNG/compare/v0.31.1...v0.31.2) (2026-11-11)
 
 
