@@ -92,6 +92,8 @@
 59. Phase 4.3: `results/rank.rs` 分離をサブエージェント実装から取り込み（`664f5bf`, `7fb910e`）— mod.rs 1,497 行 / rank.rs 832 行、ランキング単体テスト 9 件、公開 API は re-export で維持
 60. Phase 2/3: engine 例外の範囲を限定（`a89ded3`）— 有効 engine の base_url + search_url ホストのみ、proxy 時 cross-origin リダイレクト拒否、別 engine ホストへのリダイレクト拒否。単体テスト 2 件
 
+61. Phase 4.5: 抽出コーパスを 5→30 ページへ拡張（`4749e8e`）。広告・同意・購読ブロックの混入と引用元 footer の消失を検出し、限定 class/id 判定と引用内 footer 保持で修正。抽出は中央値約 168µs（debug、100k 字文書 13.5ms）
+
 ## 未完了・追跡
 
 - R3: エンジン側 pageno 演算は checked でない（入口上限で緩和）

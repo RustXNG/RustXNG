@@ -87,6 +87,16 @@ ADR 形式。各決定に「理由」「代替案」「影響」を付ける。�
   追加の型は利益が小さい。
 - 影響: 呼び出し側は URL 文字列を渡す。安全性は `fetch::is_fetchable` と接続層のテスト（`ssrf_tests`）が守る。
 
+## D22: 抽出コーパスを 30 ページへ拡張し、限定した class/id 判定を認める
+
+- 決定: D18 を一部改訂。`class`/`id` を使うのは広告・同意・購読の**先頭セグメント一致**（ad, ads, adslot,
+  advert, advertisement, sponsor, sponsored, cookie, consent, gdpr, newsletter, subscribe）に限る。
+  `related`/`social`/`advice` は対象外のまま。引用・figure 内の `<footer>` は帰属として残す。
+- 根拠: 30 ページのコーパスで 2 件の欠落を検出（広告・同意ブロックの混入、引用元の消失）。修正後は
+  ads-cookie-banner が 588→435 字（−26%）、quotes-footnotes が 581→615 字（帰属行が復活）で、
+  他の 28 ページと既存 24 テストは不変。
+- 代替案: 構造シグナルのみ（広告 div は除去できない）、全 class 語のブラックリスト（本文を誤って落とす）。
+
 ## D18: ページクロームの除去は構造シグナルだけに限る
 
 - 決定: `nav` / `footer` / `[hidden]` / `[aria-hidden=true]` / `role=navigation|banner|contentinfo|search` を
