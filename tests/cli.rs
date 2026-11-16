@@ -49,9 +49,9 @@ fn check_config_reports_the_clean_profile_readiness() {
     );
     if !local_index {
         assert!(
-            json["reasons"]
-                .as_array()
-                .is_some_and(|reasons| reasons.iter().any(|reason| reason == "no local index is available")),
+            json["reasons"].as_array().is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason == "no local index is available")),
             "the missing index is explained: {json}"
         );
     }
