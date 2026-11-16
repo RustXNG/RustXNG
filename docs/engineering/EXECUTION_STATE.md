@@ -7,7 +7,7 @@
 ## 現在
 
 - Phase: 1・2 の実装済み項目を検証済み。3 の API 契約、4 の評価基盤、5 の DX まで着手
-- ブランチ: `maturation/phase3-5-2026-11-17`（基点 `f7639ce`、candidate `c24beeb`、8 コミット、未 push）
+- ブランチ: `maturation/phase3-5-2026-11-17`（基点 `f7639ce`、最新 `a48650a`、26 コミット、未 push）
 - 次の作業: Phase 4 のルーティング/rank fusion（ライブ検証が要るため BLOCKED 相当）か、索引拡充の検討
 
 ## 完了した項目（累積）

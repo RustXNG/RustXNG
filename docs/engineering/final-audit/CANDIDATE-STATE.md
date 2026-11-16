@@ -27,7 +27,15 @@
 | 15 | `d6e6313` | docs(engineering): 監査・決定・実測 |
 | 16 | `8ca24f5` | docs(security) |
 | 17 | `d5ffe50` | style: rustfmt |
-| candidate | `d5ffe50` | 監査対象（17 コミット、未 push） |
+| 18 | `cc34686` | refactor: i18n / wikidata infobox の削除（3,657 行 + JSON 983 KB） |
+| 19 | `71388da` | feat(server): `shutdown_grace`（既定 10 秒）と drain watchdog |
+| 20 | `842a82a` | test(cli): gitignore された索引に依存しない check-config |
+| 21 | `664f5bf` | refactor(results): ランキングを `results/rank.rs` へ分離 |
+| 22 | `7fb910e` | test(results): rank.rs のグループ順序テスト |
+| 23 | `3431806` | style(cli): rustfmt |
+| 24 | `a89ded3` | security(network): proxy 経由・別 engine へのリダイレクト拒否、search_url 例外 |
+| 25 | `4749e8e` | test(extraction): コーパス 5→30 ページ、欠落 2 件の修正 |
+| candidate | `a48650a` | 監査対象（候補。routing 実験の取り込み待ち） |
 
 ## 識別
 
