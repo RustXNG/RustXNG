@@ -34,6 +34,10 @@
 | 20 | examples/fusion_lab.rs, bench/local-retrieval/fusion-lab/ | `feat(eval): offline rank-fusion lab` |
 | 21 | src/i18n.rs, src/wikidata_infobox.rs, tools/import_translations.py, docs | `refactor: remove unused i18n and wikidata infobox modules` |
 | 22 | src/settings.rs, src/main.rs, tests/cli.rs | `feat(server): bound the shutdown drain with shutdown_grace` |
+| 23 | src/network.rs | `security(network): distrust redirects through proxies and to other engines` |
+| 24 | tests/fixtures/extraction/, src/content.rs | `test(extraction): grow the offline corpus to 30 pages` |
+| 25 | examples/routing_lab.rs, bench/local-retrieval/routing-lab/ | `test(routing): compare engine-routing strategies offline` |
+| 26 | src/results/mod.rs, src/results/rank.rs | `refactor(results): move ranking and policy into results/rank.rs` |
 
 整形のみの差分（src/results.rs など）は対応するコミットに混ぜず、`style:` として分けるか
 該当コミットの本文に rustfmt と明記する。

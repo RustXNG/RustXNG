@@ -87,6 +87,13 @@ ADR 形式。各決定に「理由」「代替案」「影響」を付ける。�
   追加の型は利益が小さい。
 - 影響: 呼び出し側は URL 文字列を渡す。安全性は `fetch::is_fetchable` と接続層のテスト（`ssrf_tests`）が守る。
 
+## D23: ルーティングの既定は変更しない（能力適合は実 A/B 待ち）
+
+- 決定: シミュレーションで優位な capability-aware / category-aware を既定にしない。staged の既定（tier 8, target 10）も据え置く。
+- 理由: 効果量が「クエリと engine の能力適合」という仮定に依存し（offcap 0.35→0.70 で MRR 優位 +0.206→+0.047）、実エンジンでの A/B が無い。
+- 代替案: tier 3 は Hit@10 −17.8pt で不採用。reliability-aware は 1–2% 失敗率では no-op。
+- 次段: `src/query.rs` の種別判定 → `select_engines` の拡張という低コスト案から、許可・予算のある実 A/B で検証する。
+
 ## D22: 抽出コーパスを 30 ページへ拡張し、限定した class/id 判定を認める
 
 - 決定: D18 を一部改訂。`class`/`id` を使うのは広告・同意・購読の**先頭セグメント一致**（ad, ads, adslot,

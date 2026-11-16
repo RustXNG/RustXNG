@@ -94,6 +94,8 @@
 
 61. Phase 4.5: 抽出コーパスを 5→30 ページへ拡張（`4749e8e`）。広告・同意・購読ブロックの混入と引用元 footer の消失を検出し、限定 class/id 判定と引用内 footer 保持で修正。抽出は中央値約 168µs（debug、100k 字文書 13.5ms）
 
+62. Phase 4.2: ルーティング研究（`826bbe5`）。`examples/routing_lab.rs` と `bench/local-retrieval/routing-lab/` を収録。8 状態のシミュレーションで capability/category-aware が支配するが、仮定依存のため既定は不変（D23）
+
 ## 未完了・追跡
 
 - R3: エンジン側 pageno 演算は checked でない（入口上限で緩和）

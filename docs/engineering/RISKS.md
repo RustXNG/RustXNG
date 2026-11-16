@@ -15,5 +15,6 @@
 | R10 | ~~P2~~ 解消 | shutdown drain の期限 | `server.shutdown_grace`（既定 10 秒）を追加（コミット 71388da）、2 テストで検証 |
 | R11 | ~~P2~~ 解消 | engine 例外の適用範囲 | 2026-11-17 修正（a89ded3）。有効 engine の base_url + search_url ホストのみ、proxy 時は cross-origin 拒否、別 engine ホストへのリダイレクト拒否。リダイレクト先/結果 URL/画像/MCP には非適用 |
 | R12 | P2 | 多ソース融合評価の fixture が商用 API ダンプ（gitignore）依存で、クリーンクローンでは n=13 しか再現できない | `.gitignore` に対象 JSON、`bench/local-retrieval/fusion-lab/README.md` に注記 | URL+順位のみの派生 fixture を追跡下に作る（n≥100） |
+| R14 | P2 | capability-aware ルーティングの効果量は仮定依存で、実エンジン A/B が無い | `routing_lab` の offcap 感度（MRR 優位 +0.206 → +0.047）、F5（deadline 指標が判別不能） | ライブ検索の許可・予算を得て A/B。それまで既定は不変（D23） |
 | R13 | P3 | 既存の融合層は「単一プロバイダ単独」に有意に勝てない（ablation: position-only 0.768 < solo:exa 0.835、p=0.0015） | fusion-lab の実測（ローカル限定 fixture） | 主張を「融合層」と「後段の lexical/authority」に分けて記録 |
 | R8 | P3 | プロバイダー条件の確認は「記録」であり法的適合の保証ではない | docs/PROVIDERS.md, docs/provider-policy.json | 利用者向けの注意書きを維持 |

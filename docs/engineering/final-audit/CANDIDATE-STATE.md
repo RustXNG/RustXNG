@@ -35,7 +35,8 @@
 | 23 | `3431806` | style(cli): rustfmt |
 | 24 | `a89ded3` | security(network): proxy 経由・別 engine へのリダイレクト拒否、search_url 例外 |
 | 25 | `4749e8e` | test(extraction): コーパス 5→30 ページ、欠落 2 件の修正 |
-| candidate | `a48650a` | 監査対象（候補。routing 実験の取り込み待ち） |
+| 26 | `826bbe5` | test(routing): ルーティング戦略のオフライン比較 |
+| candidate | `826bbe5` | 監査対象（28 コミット、未 push） |
 
 ## 識別
 
