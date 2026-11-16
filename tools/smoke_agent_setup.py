@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http.client
 import http.server
 import json
 import os
@@ -264,9 +265,28 @@ def child_environment(extra: dict) -> dict:
     return env
 
 
-def http_get(url: str) -> tuple:
-    """GET a URL; return (status, content type, body text)."""
-    request = urllib.request.Request(url, headers={"Accept": "*/*"})
+def http_get(url: str, attempts: int = 3) -> tuple:
+    """GET a URL; return (status, content type, body text).
+
+    A keep-alive connection that the server closes while the body is being read
+    surfaces as a platform-specific OSError on Windows (WSAENOTSOCK, 10038).
+    Retrying with a fresh connection is the portable answer.
+    """
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return _http_get_once(url)
+        except (OSError, http.client.HTTPException) as error:
+            last_error = error
+            if attempt + 1 < attempts:
+                time.sleep(0.2)
+    raise last_error
+
+
+def _http_get_once(url: str) -> tuple:
+    request = urllib.request.Request(
+        url, headers={"Accept": "*/*", "Connection": "close"}
+    )
     try:
         with OPENER.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             body = response.read().decode("utf-8", errors="replace")
