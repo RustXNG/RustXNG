@@ -18,7 +18,16 @@
 | 6 | `91a8f67` | feat(web): エラー形式・/readyz・各種上限・ブランド |
 | 7 | `b5dc2a5` | test: CLI・抽出コーパス・統合テスト |
 | 8 | `c24beeb` | docs(tools): OpenAPI・評価ツール・依存ポリシー・記録 |
-| candidate | `c24beeb` | 監査対象 |
+| 9 | `14f6228` | security(network): engine クライアントの検証・リダイレクト・本文上限 |
+| 10 | `78eba37` | fix(web): CSV の数式注入を無害化 |
+| 11 | `a69f961` | fix(web): limiter 順序・media バケット・real_ip・readyz 索引 |
+| 12 | `e6181cb` | fix(engine): poison 耐性と suspension 上限 |
+| 13 | `d7428e1` | docs(legal): CDLA と source リンク |
+| 14 | `4e0cd68` | feat(eval): オフライン融合実験ラボ |
+| 15 | `d6e6313` | docs(engineering): 監査・決定・実測 |
+| 16 | `8ca24f5` | docs(security) |
+| 17 | `d5ffe50` | style: rustfmt |
+| candidate | `d5ffe50` | 監査対象（17 コミット、未 push） |
 
 ## 識別
 
