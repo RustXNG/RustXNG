@@ -2,6 +2,13 @@
 
 [English](README.md) · [日本語](README.ja.md)
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="static/logo-wordmark-light.png">
+    <img src="static/logo-wordmark.png" alt="RustXNG" width="440">
+  </picture>
+</p>
+
 RustXNG는 [SearXNG](https://github.com/searxng/searxng)를 바탕으로 만든 Rust 기반 셀프 호스팅 메타 검색 엔진입니다. 여러 외부 검색 제공자의 결과를 합치고, JSON API와 MCP를 통해 AI 에이전트가 검색 결과와 페이지 본문을 사용할 수 있게 합니다.
 
 웹 전체를 자체적으로 크롤링하거나 대규모 검색 색인을 운영하지는 않습니다. `rustxng-index`로 선택한 사이트의 로컬 색인을 추가하거나 Wikipedia 공식 덤프를 별도로 색인할 수 있습니다.
@@ -61,7 +68,7 @@ MCP `read_page` 또는 HTTP `include_raw_content`에서 `accept_language`를 지
 
 HTTP API는 `include_raw_content=1`로 본문을 가져올 수 있습니다. PDF 텍스트 추출에는 Poppler(`pdftotext`)가 필요하며 스캔 PDF에는 별도 OCR이 필요합니다. JavaScript로 생성되는 본문을 읽으려면 선택 사항인 [Firefox 렌더러](tools/page-renderer/README.md)를 설정하세요.
 
-`include_raw_content=1`을 사용하면 각 결과의 `raw_content_status`로 본문 조회 상태를 확인할 수 있습니다. 오류에 관한 짧은 설명이 제공되는 경우 `raw_content_error`도 포함됩니다.
+`include_raw_content=1`을 사용하면 각 결과의 `raw_content_status`로 본문 조회 상태를 확인할 수 있습니다. 값은 `ok`, `not_requested`, `too_large`, `fetch_failed`, `robots_blocked`, `extract_failed`, `render_failed`, `unknown` 가운데 하나이며, 오류에 관한 짧은 설명이 제공되는 경우 `raw_content_error`도 포함됩니다. 본문 상한은 `raw_content_max_bytes`로 변경할 수 있고(기본 4MiB, 상한 32MiB), 렌더러가 실패하면 기본적으로 정적 HTML 본문을 유지합니다(`page_renderer_fallback = "static"`).
 
 ## 검색 프로필
 
@@ -106,9 +113,9 @@ rustxng --config my-settings.toml
 
 사용자 설정은 선택한 프로필 위에 적용됩니다. 의도하지 않은 검색 제공자 변경을 피하려면 전체 기본 설정을 복사하지 마세요.
 
-`rustxng --check-update`로 업데이트를 확인하고, 지원되는 바이너리 설치에서는 `rustxng --update`를 사용할 수 있습니다. 컨테이너나 패키지 관리자로 설치했다면 원래의 업데이트 방법을 사용하세요.
+`rustxng --check-config`는 프로필과 설정을 읽고 엔진을 구성한 뒤 `{"profile", "ready", "engines", "local_index", "reasons", "warnings"}`를 출력하며(`warnings`는 `search.max_page = 0`처럼 유효하지만 의도와 다를 수 있는 설정을 알려 줍니다), 포트를 열지 않고 종료합니다. `rustxng --check-update`로 업데이트를 확인하고, 지원되는 바이너리 설치에서는 `rustxng --update`를 사용할 수 있습니다. 컨테이너나 패키지 관리자로 설치했다면 원래의 업데이트 방법을 사용하세요.
 
-`/healthz`는 프로세스 상태만 확인합니다. 실제 검색 가능 여부는 JSON 검색으로 검증하세요. 실행 통계는 `/stats`와 `/metrics`에서 볼 수 있습니다.
+`/healthz`는 프로세스 상태만 확인합니다. `/readyz`는 검색 소스가 구성되어 있는지(`engines`, `local_index`)를 보고하며, 페이지는 제공되지만 검색은 불가능한 구성에서는 503을 반환합니다. 두 엔드포인트 모두 외부 프로바이더에 질의하지 않습니다. 실제 검색 가능 여부는 JSON 검색으로 검증하세요. 실행 통계는 `/stats`와 `/metrics`에서 볼 수 있습니다. 프로세스는 `SIGTERM`과 Ctrl-C에서 안전하게 종료되어 처리 중인 요청을 마치고 멈춥니다.
 
 ## 검색 품질과 제한
 

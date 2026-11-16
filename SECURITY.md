@@ -49,6 +49,9 @@ cargo install cargo-audit --locked
 cargo audit
 ```
 
+Licences, banned constructs and registry sources are checked by `cargo deny` using [deny.toml](deny.toml);
+see [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for the policy and the process for adding an exception.
+
 The recorded audit found `ctutils 0.4.2` / RUSTSEC-2026-0385 and unsoundness advisories for `lru 0.12.5`,
 plus maintenance warnings. The default `db-engines` feature enables the PostgreSQL and MySQL dependency chains;
 it is incorrect to claim these dependencies are absent from the default build.

@@ -2,6 +2,13 @@
 
 [日本語](README.ja.md) · [한국어](README.ko.md)
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="static/logo-wordmark-light.png">
+    <img src="static/logo-wordmark.png" alt="RustXNG" width="440">
+  </picture>
+</p>
+
 RustXNG is a self-hosted metasearch engine written in Rust, based on [SearXNG](https://github.com/searxng/searxng). It combines results from external search providers and can fetch page text for AI agents through a JSON API or MCP.
 
 RustXNG does not maintain a web-scale search index. You can add a local index of selected sites with `rustxng-index` and import Wikipedia dumps separately.
@@ -89,7 +96,7 @@ docker run --rm -p 127.0.0.1:29483:29483 \
   --bind 0.0.0.0 --port 29483
 ```
 
-By default, the service binds to loopback. Exposing it to another network requires appropriate access controls.
+By default, the service binds to loopback. Exposing it to another network requires appropriate access controls. The process stops cleanly on `SIGTERM` or Ctrl-C: in-flight requests finish before it exits, so `docker stop` and `systemctl stop` do not have to kill it.
 
 Settings are embedded. To override a value, create a small `my-settings.toml`, for example:
 
@@ -102,9 +109,9 @@ idle_timeout = 600
 rustxng --config my-settings.toml
 ```
 
-A custom settings file is layered over the selected profile; avoid copying all shipped settings or adding an unintended engine override. Use `rustxng --check-update` to check for a release or `rustxng --update` for a supported binary installation. For managed packages and containers, use the original installation method.
+A custom settings file is layered over the selected profile; avoid copying all shipped settings or adding an unintended engine override. `rustxng --check-config` loads the profile and settings, builds the engines and prints `{"profile", "ready", "engines", "local_index", "reasons", "warnings"}` without opening a socket (warnings cover valid-but-surprising settings such as `search.max_page = 0`), so a broken configuration fails before the service starts. Use `rustxng --check-update` to check for a release or `rustxng --update` for a supported binary installation. For managed packages and containers, use the original installation method.
 
-The `/healthz` endpoint checks the process, not the availability of upstream providers. Use a real JSON search to verify that results are returned. Runtime metrics are exposed at `/stats` and `/metrics`.
+The `/healthz` endpoint checks the process, not the availability of upstream providers. `/readyz` reports whether any source is configured at all (`engines`, `local_index`) and answers 503 when a profile can serve pages but cannot search; it never contacts a provider. Use a real JSON search to verify that results are returned. Runtime metrics are exposed at `/stats` and `/metrics`.
 
 ## Search quality and limitations
 

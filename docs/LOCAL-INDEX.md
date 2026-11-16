@@ -116,6 +116,25 @@ canonicalは同一オリジンのURLのみ採用し、フラグメントと既�
 PDF・画像・スクリプトなどは索引クローラーの対象外です。HTML本文はJavaScriptを実行せず抽出します。
 停止時はホスト間隔とバックオフの待機を解除します。送信済みのHTTP要求は完了または20秒のタイムアウトを待ちます。
 
+## 評価（オフライン・ネットワーク不要）
+
+自前インデックスの検索品質は、外部プロバイダーへ問い合わせずに測れます。
+
+```bash
+cargo run --release --locked --example local_quality -- index-docs bench/quality-questions-100.json > /tmp/local.json
+python3 tools/eval_local_index.py /tmp/local.json --json /tmp/local-metrics.json
+# 変更前後の比較
+python3 tools/eval_local_index.py /tmp/local-after.json --baseline /tmp/local-before.json
+```
+
+`tools/eval_local_index.py` は Hit@1 / Hit@5 / Hit@10、MRR@10、nDCG@10（二値関連度）、
+p50 / p95 を出します。gold URL の照合は [reference_urls.py](../tools/reference_urls.py) の
+パス境界ルールを使うため、ディレクトリ参照と `.html` の別ページを混同しません。
+`--min-hit5` を付けると下限を割ったときに終了コード 1 を返し、CI のゲートにできます。
+
+この数値は**索引に含まれる範囲**の上限に縛られます。Wikipedia・論文・公式サイトを gold に持つ質問は、
+文書索引だけでは到達できないため、ヒット率の低さをそのままランキングの欠陥と解釈しないでください。
+
 ## 過去の評価
 
 今回のローカル検索・集約処理の変更前後比較は [評価手順と生データ](../bench/local-retrieval/README.md) を参照してください。

@@ -30,6 +30,13 @@ AGPL-3.0-or-later. If you publish a modified version — including running a
 modified instance as a network service — section 13 of the AGPL requires you
 to offer the corresponding source to its users.
 
+Brand assets
+------------
+  The name "RustXNG" and the artwork in `static/` (logo, wordmark, favicon)
+  identify this project. The artwork was supplied by the project maintainer
+  and is not derived from SearXNG. The AGPL-3.0-or-later licence covers the
+  source code; it does not grant trademark rights in the name or the logo.
+
 Third party data
 ----------------
 The bundled external bang list is a reduced, hand written table; upstream ships

@@ -66,7 +66,17 @@ curl --fail --get 'http://127.0.0.1:29483/search' \
 
 ### ディープリサーチ（`GET /research`、上流にない）
 
-質問を受け取り、(1) サブクエリを計画（LLM があれば LLM、無ければ質問から派生）、(2) 各クエリを検索して上位ページの本文を取得、(3) LLM があれば引用付き markdown レポートを生成して返します。LLM 未設定でも証拠バンドル（`queries` / `sources` / 本文）は返ります。設定は `settings.toml` の `[research]`（`enabled` / `base_url` / `api_key` / `model` / `max_queries` / `max_sources`）。
+質問を受け取り、(1) サブクエリを計画（LLM があれば LLM、無ければ質問から派生）、(2) 各クエリを検索して上位ページの本文を取得、(3) LLM があれば引用付き markdown レポートを生成して返します。LLM 未設定でも証拠バンドル（`queries` / `sources` / 本文）は返ります。設定は `settings.toml` の `[research]`（`enabled` / `base_url` / `api_key` / `model` / `max_queries` / `max_sources` / `timeout` / `deadline` / `max_concurrency`）。`deadline`（既定120秒）はリクエスト全体の期限で、超過すると 504 と JSON のエラーを返します。`max_concurrency`（既定2）を超える同時実行は 429 で断ります。
+
+### ヘルスチェック（`GET /readyz`、上流にない）
+
+`/healthz` はプロセスの応答だけを返します。`/readyz` は構成された検索元の数（`engines`）とローカル索引の有無（`local_index`）を JSON で返し、どちらも無い構成では 503 になります。外部プロバイダーへは問い合わせないため、200 は「手元に検索手段がある」ことを示すだけで、上流の可用性は保証しません。
+
+```json
+{"ready": true, "engines": 34, "local_index": true, "reasons": []}
+```
+
+機械可読な API 仕様は [openapi.yaml](openapi.yaml) にあります（`tools/test_openapi.py` がコードとの不一致を検出します）。
 
 ## 互換でない領域
 
@@ -86,6 +96,8 @@ curl --fail --get 'http://127.0.0.1:29483/search' \
 - 構文・統合ロジック・JSON/CSV の形: `cargo test --locked --all-targets`。テスト数は変更により変わるため、現行CIの結果を確認してください。
 - 上流との実測比較（速度・結果一致度）: [BENCHMARK.md](BENCHMARK.md) と `bench/compare.py`
 - エンジン網羅率: `python3 tools/coverage.py /path/to/searxng`
+- リクエストボディ: 64 KiB を超える POST（`/search`、`/preferences`）は 413 で拒否します（axum 既定の 2 MiB より厳しくしています）。`format=json` を指定していれば、ボディ超過やクエリ文字列の不正（例: `pageno=abc`）も `{"error": ...}` の JSON で返します。
+- 本文抽出: `cargo test --locked --test extraction`。`tests/fixtures/extraction/` の HTML と `manifest.json` が、各ページで残すべき文字列・残してはいけない文字列（ナビ、フッター、非表示要素）・最小文字数を宣言します。ネットワークは使いません。
 
 ## 完全互換に近づけるには
 

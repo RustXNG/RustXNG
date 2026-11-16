@@ -51,5 +51,35 @@ class FailureLatencyTest(unittest.TestCase):
         self.assertIn("OSError", report["rows"][2]["error"])
 
 
+class RestartInstanceTests(unittest.TestCase):
+    def test_a_missing_binary_is_rejected_before_anything_starts(self):
+        with self.assertRaises(ValueError) as caught:
+            eval_quality.restart_instance(
+                "/nonexistent/rustxng", 8905, "http://127.0.0.1:8905"
+            )
+        self.assertIn("not found", str(caught.exception))
+
+    def test_a_missing_fuser_is_reported_not_ignored(self):
+        with patch("eval_quality.shutil.which", return_value=None):
+            with self.assertRaises(RuntimeError) as caught:
+                eval_quality.restart_instance(
+                    "/bin/true", 8905, "http://127.0.0.1:8905"
+                )
+        self.assertIn("fuser", str(caught.exception))
+
+    def test_a_binary_that_exits_is_reported(self):
+        # /bin/false exists and exits immediately; fuser is stubbed out so the
+        # test never kills a real process.
+        with (
+            patch("eval_quality.shutil.which", return_value="/usr/bin/fuser"),
+            patch("eval_quality.subprocess.run"),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                eval_quality.restart_instance(
+                    "/bin/false", 8905, "http://127.0.0.1:8905", attempts=2
+                )
+        self.assertIn("exited", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -92,6 +92,20 @@ class DocumentationConsistencyTests(unittest.TestCase):
         self.assertIn('"index_state": "not determined by this evaluator', source)
         self.assertNotIn("; no local index;", source)
 
+    def test_branding_assets_exist_and_are_linked(self) -> None:
+        for name in (
+            "static/logo.png",
+            "static/logo-wordmark.png",
+            "static/logo-wordmark-light.png",
+            "static/favicon.ico",
+        ):
+            self.assertTrue((ROOT / name).is_file(), name)
+        for filename in ("README.md", "README.ja.md", "README.ko.md"):
+            readme = (ROOT / filename).read_text(encoding="utf-8")
+            self.assertIn("static/logo-wordmark.png", readme, filename)
+            self.assertIn("static/logo-wordmark-light.png", readme, filename)
+            self.assertIn('alt="RustXNG"', readme, filename)
+
 
 if __name__ == "__main__":
     unittest.main()

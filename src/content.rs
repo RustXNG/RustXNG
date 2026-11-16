@@ -99,7 +99,6 @@ const BLOCKS: &[&str] = &[
     "p",
     "section",
     "summary",
-    "table",
     "tr",
     "ul",
 ];
@@ -140,6 +139,9 @@ fn collect_text(element: ElementRef<'_>, out: &mut Vec<Segment>) {
         match name {
             "br" => out.push(Segment::Break),
             "pre" => out.push(Segment::Pre(preformatted_text(element))),
+            "table" => out.push(Segment::Pre(render_table(element))),
+            "math" => out.push(Segment::Flow(math_text(element))),
+            _ if repeats_a_formula(&element) || is_page_chrome(&element) => {}
             _ if BLOCKS.contains(&name) => {
                 out.push(Segment::Break);
                 stack.push(Step::Break);
@@ -148,6 +150,66 @@ fn collect_text(element: ElementRef<'_>, out: &mut Vec<Segment>) {
             _ => stack.extend(node.children().rev().map(Step::Enter)),
         }
     }
+}
+
+/// Navigation, footers and explicitly hidden subtrees are page chrome, not
+/// article text. Only structural signals are used: class names such as
+/// `related` or `social` also appear in legitimate prose.
+fn is_page_chrome(element: &ElementRef<'_>) -> bool {
+    let value = element.value();
+    if matches!(value.name(), "nav" | "footer") {
+        return true;
+    }
+    if value.attr("hidden").is_some() {
+        return true;
+    }
+    if value
+        .attr("aria-hidden")
+        .is_some_and(|hidden| hidden.eq_ignore_ascii_case("true"))
+    {
+        return true;
+    }
+    value.attr("role").is_some_and(|role| {
+        matches!(
+            role.to_ascii_lowercase().as_str(),
+            "navigation" | "banner" | "contentinfo" | "search"
+        )
+    })
+}
+
+/// Renderers paint a formula twice: KaTeX keeps the MathML plus a visual HTML
+/// copy, MathJax adds an assistive copy. Only one of them may reach the text.
+fn repeats_a_formula(element: &ElementRef<'_>) -> bool {
+    if matches!(
+        element.value().name(),
+        "mjx-assistive-mml" | "mjx-assistive"
+    ) {
+        return true;
+    }
+    element
+        .value()
+        .attr("class")
+        .is_some_and(|classes| {
+            classes
+                .split_whitespace()
+                .any(|class| matches!(class, "katex-html" | "MJX-TEX"))
+        })
+}
+
+/// The readable text of one formula: the original TeX annotation when the
+/// renderer left one, else the concatenated MathML text.
+fn math_text(math: ElementRef<'_>) -> String {
+    static ANNOTATION: std::sync::OnceLock<scraper::Selector> = std::sync::OnceLock::new();
+    let selector = ANNOTATION.get_or_init(|| {
+        scraper::Selector::parse("annotation").expect("static annotation selector")
+    });
+    if let Some(annotation) = math.select(selector).next() {
+        let tex = normalise(&annotation.text().collect::<String>());
+        if !tex.is_empty() {
+            return tex;
+        }
+    }
+    normalise(&math.text().collect::<String>())
 }
 
 /// The text of a `<pre>` subtree as written, without non-content subtrees;
@@ -170,6 +232,78 @@ fn preformatted_text(pre: ElementRef<'_>) -> String {
     out
 }
 
+/// Largest table this renderer keeps: extra rows and columns are dropped so a
+/// pathological page cannot turn extraction into unbounded text.
+const MAX_TABLE_ROWS: usize = 200;
+const MAX_TABLE_COLUMNS: usize = 32;
+const MAX_TABLE_CELL_CHARS: usize = 160;
+
+/// Render a table as Markdown-style rows so the columns stay readable.
+///
+/// Row and column boundaries are the information an AI agent needs from a
+/// table; the flat text of a wide table otherwise reads as one run of words.
+fn render_table(table: ElementRef<'_>) -> String {
+    let mut rows = Vec::new();
+    collect_rows(table, &mut rows, 0);
+    let mut lines = Vec::new();
+    // The caption names the table; the row walk never reaches it.
+    if let Some(caption) = table
+        .children()
+        .filter_map(ElementRef::wrap)
+        .find(|child| child.value().name() == "caption")
+        .map(table_cell_text)
+        .filter(|text| !text.is_empty())
+    {
+        lines.push(caption);
+    }
+    for (index, row) in rows.iter().take(MAX_TABLE_ROWS).enumerate() {
+        let cells: Vec<ElementRef<'_>> = row
+            .children()
+            .filter_map(ElementRef::wrap)
+            .filter(|cell| matches!(cell.value().name(), "td" | "th"))
+            .collect();
+        if cells.is_empty() {
+            continue;
+        }
+        let header = cells.iter().all(|cell| cell.value().name() == "th");
+        let text: Vec<String> = cells
+            .iter()
+            .take(MAX_TABLE_COLUMNS)
+            .map(|cell| table_cell_text(*cell))
+            .collect();
+        lines.push(format!("| {} |", text.join(" | ")));
+        if header && index == 0 {
+            lines.push(format!("|{}", " --- |".repeat(text.len())));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Rows of `table` in document order, ignoring rows of nested tables.
+fn collect_rows<'a>(element: ElementRef<'a>, rows: &mut Vec<ElementRef<'a>>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    for child in element.children() {
+        let Some(child) = ElementRef::wrap(child) else {
+            continue;
+        };
+        match child.value().name() {
+            "tr" => rows.push(child),
+            "table" => {}
+            _ => collect_rows(child, rows, depth + 1),
+        }
+    }
+}
+
+/// One cell on a single line: pipes escaped, newlines flattened, bounded.
+fn table_cell_text(cell: ElementRef<'_>) -> String {
+    let text = readable_text(cell);
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let escaped = flat.replace('|', "\\|");
+    truncate(&escaped, MAX_TABLE_CELL_CHARS)
+}
+
 /// Join the segments into lines: flowing text is normalised line by line and
 /// empty lines are dropped. Preformatted blocks keep their lines and
 /// indentation, minus trailing spaces and the blank lines around them.
@@ -177,7 +311,7 @@ fn join_lines(segments: &[Segment]) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut line = String::new();
     let flush = |line: &mut String, lines: &mut Vec<String>| {
-        let collapsed = normalise(line);
+        let collapsed = tidy(&normalise(line));
         if !collapsed.is_empty() {
             lines.push(collapsed);
         }
@@ -204,6 +338,31 @@ fn join_lines(segments: &[Segment]) -> String {
     }
     flush(&mut line, &mut lines);
     lines.join("\n")
+}
+
+/// Drop the space that joining inline elements leaves before closing
+/// punctuation (`config.yaml :` becomes `config.yaml:`).
+fn tidy(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut pending = false;
+    for character in line.chars() {
+        if character == ' ' {
+            pending = true;
+            continue;
+        }
+        if pending {
+            let tight = matches!(
+                character,
+                '.' | ',' | ':' | ';' | '!' | '?' | ')' | ']' | '%'
+            );
+            if !tight && !out.is_empty() {
+                out.push(' ');
+            }
+            pending = false;
+        }
+        out.push(character);
+    }
+    out
 }
 
 /// Collapse whitespace and drop empty lines.
@@ -291,7 +450,7 @@ mod tests {
         );
         assert_eq!(
             main_text(&html),
-            "설치\n먼저 tmux 를 설치한다.\n하나\n둘\n셋\n키 값\na 1"
+            "설치\n먼저 tmux 를 설치한다.\n하나\n둘\n셋\n| 키 | 값 |\n| a | 1 |"
         );
     }
 
@@ -304,8 +463,158 @@ mod tests {
         );
         assert_eq!(
             main_text(&html),
-            "Put this in config.yaml :\nserver:\n  port: 8080\n\n  host: 0.0.0.0\nThen restart."
+            "Put this in config.yaml:\nserver:\n  port: 8080\n\n  host: 0.0.0.0\nThen restart."
         );
+    }
+
+    #[test]
+    fn tables_keep_rows_columns_and_a_header_separator() {
+        let html = Html::parse_document(
+            "<html><body><article><table>\
+             <thead><tr><th>Name</th><th>Default</th></tr></thead>\
+             <tbody><tr><td><code>--port</code></td><td>29483</td></tr>\
+             <tr><td>--bind</td><td>127.0.0.1</td></tr></tbody>\
+             </table></article></body></html>",
+        );
+        assert_eq!(
+            main_text(&html),
+            "| Name | Default |\n| --- | --- |\n| --port | 29483 |\n| --bind | 127.0.0.1 |"
+        );
+    }
+
+    #[test]
+    fn table_cells_escape_pipes_and_stay_bounded() {
+        let long = "x".repeat(400);
+        let html = Html::parse_document(&format!(
+            "<html><body><article><table><tr><td>a|b</td><td>{long}</td></tr></table></article></body></html>"
+        ));
+        let text = main_text(&html);
+        assert!(text.contains("| a\\|b |"), "{text}");
+        assert!(text.contains('…'), "a long cell is truncated: {text}");
+        assert!(text.lines().next().unwrap().chars().count() < 250);
+    }
+
+    #[test]
+    fn a_nested_table_does_not_repeat_its_rows() {
+        let html = Html::parse_document(
+            "<html><body><article><table><tr><td>outer<div><table><tr><td>inner</td></tr></table></div>\
+             </td><td>second</td></tr></table></article></body></html>",
+        );
+        let text = main_text(&html);
+        assert_eq!(text.matches("inner").count(), 1, "{text}");
+        assert!(text.contains("outer"), "{text}");
+        assert!(text.contains("second"), "{text}");
+    }
+
+    #[test]
+    fn page_chrome_is_not_part_of_the_article_text() {
+        let html = Html::parse_document(
+            "<html><body>\
+             <nav><a href=\"/\">Home</a><a href=\"/docs\">Docs</a></nav>\
+             <p>The main paragraph.</p>\
+             <footer>Copyright 2026 Example</footer>\
+             <div hidden>hidden text</div>\
+             <div aria-hidden=\"true\">decorative text</div>\
+             <div role=\"navigation\">menu text</div>\
+             </body></html>",
+        );
+        let text = main_text(&html);
+        assert_eq!(text, "The main paragraph.");
+    }
+
+    #[test]
+    fn an_article_header_is_kept_even_though_page_chrome_is_not() {
+        let html = Html::parse_document(
+            "<html><body><nav>menu</nav><article><header><h1>Ownership</h1></header>\
+             <p>Ownership is the core idea.</p><footer>tags: rust</footer></article>\
+             <footer>site footer</footer></body></html>",
+        );
+        let text = main_text(&html);
+        assert!(text.contains("Ownership"), "{text}");
+        assert!(text.contains("Ownership is the core idea."), "{text}");
+        assert!(!text.contains("menu"), "{text}");
+        assert!(!text.contains("site footer"), "{text}");
+    }
+
+    #[test]
+    fn footnote_references_and_their_notes_both_survive() {
+        let html = Html::parse_document(
+            "<html><body><article><p>A claim<sup><a href=\"#fn1\" id=\"r1\">[1]</a></sup>.</p>\
+             <ol><li id=\"fn1\">The source.</li></ol></article></body></html>",
+        );
+        let text = main_text(&html);
+        assert!(text.contains("A claim [1]."), "{text}");
+        assert!(text.contains("The source."), "{text}");
+        assert_eq!(text.matches("[1]").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn definition_lists_keep_terms_and_definitions_on_their_own_lines() {
+        let html = Html::parse_document(
+            "<html><body><article><dl><dt>port</dt><dd>The listening port.</dd>\
+             <dt>bind</dt><dd>The listening address.</dd></dl></article></body></html>",
+        );
+        assert_eq!(
+            main_text(&html),
+            "port\nThe listening port.\nbind\nThe listening address."
+        );
+    }
+
+    #[test]
+    fn a_table_caption_is_kept_above_the_rows() {
+        let html = Html::parse_document(
+            "<html><body><article><table><caption>Table 1: Ports</caption>\
+             <tr><th>Name</th><th>Port</th></tr><tr><td>http</td><td>29483</td></tr>\
+             </table></article></body></html>",
+        );
+        assert_eq!(
+            main_text(&html),
+            "Table 1: Ports\n| Name | Port |\n| --- | --- |\n| http | 29483 |"
+        );
+    }
+
+    #[test]
+    fn wide_tables_are_cut_at_the_column_limit() {
+        let cells = "<td>c</td>".repeat(40);
+        let html = Html::parse_document(&format!(
+            "<html><body><article><table><tr>{cells}</tr></table></article></body></html>"
+        ));
+        let text = main_text(&html);
+        let columns = text.matches("| c ").count();
+        assert_eq!(columns, 32, "columns are capped: {text}");
+    }
+
+    #[test]
+    fn katex_markup_yields_the_formula_once() {
+        let html = Html::parse_document(
+            "<html><body><article><p>Euler:</p><span class=\"katex\">\
+             <span class=\"katex-mathml\"><math><semantics><mrow><msup><mi>e</mi></msup></mrow>\
+             <annotation encoding=\"application/x-tex\">e^{i\\pi}</annotation></semantics></math></span>\
+             <span class=\"katex-html\" aria-hidden=\"true\"><span class=\"base\">\
+             <span class=\"mord\">e</span><span class=\"mord\">i</span><span class=\"mord\">π</span>\
+             </span></span></span></article></body></html>",
+        );
+        let text = main_text(&html);
+        assert_eq!(text.matches("π").count(), 0, "the visual copy is skipped: {text}");
+        assert!(text.contains("e^{i\\pi}"), "{text}");
+    }
+
+    #[test]
+    fn mathml_keeps_the_annotation_instead_of_the_markup_text() {
+        let html = Html::parse_document(
+            "<html><body><article><math><semantics><mrow><mi>a</mi><mo>+</mo><mi>b</mi></mrow>\
+             <annotation encoding=\"application/x-tex\">a+b</annotation></semantics></math></article></body></html>",
+        );
+        assert_eq!(main_text(&html), "a+b");
+    }
+
+    #[test]
+    fn mathjax_assistive_copy_is_not_repeated() {
+        let html = Html::parse_document(
+            "<html><body><article><mjx-container class=\"MathJax\"><mjx-math><mi>x</mi></mjx-math>\
+             <mjx-assistive-mml><math><mi>x</mi></math></mjx-assistive-mml></mjx-container></article></body></html>",
+        );
+        assert_eq!(main_text(&html), "x");
     }
 
     #[test]

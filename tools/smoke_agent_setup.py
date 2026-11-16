@@ -7,7 +7,10 @@ localhost and checks what an agent relies on:
 * ``/healthz`` answers,
 * ``/config`` reports a ``RustXNG ...`` version and the project ``GIT_URL``,
 * ``/search?format=json&max_results=5`` returns the fake engine's known result,
-* ``/opensearch.xml`` advertises the port actually listened on.
+* ``/opensearch.xml`` advertises the port actually listened on,
+* ``/readyz`` reports ready with the configured engine,
+* a real stdio MCP session initializes, lists ``search``/``read_page`` and
+  returns the fake engine result (``tools/mcp_smoke.py``).
 
 Cases:
 
@@ -40,6 +43,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import mcp_smoke
 
 DEFAULT_PORT = 29483
 GIT_URL = "https://github.com/sahenjp/RustXNG"
@@ -378,6 +383,21 @@ def check_search(base: str, fake: FakeMwmbl) -> None:
         raise SmokeFailure(f"fake Mwmbl did not receive the query (got {seen!r})")
 
 
+def check_ready(base: str) -> None:
+    """`/readyz` must agree with the configured sources."""
+    status, content_type, body = http_get(f"{base}/readyz")
+    if status != 200:
+        raise SmokeFailure(f"/readyz returned HTTP {status}: {body[:300]}")
+    report = json.loads(body)
+    if report.get("ready") is not True:
+        raise SmokeFailure(f"/readyz is not ready: {body[:300]}")
+    engines = report.get("engines")
+    if not isinstance(engines, int) or engines < 1:
+        raise SmokeFailure(f"/readyz reports engines={engines!r}")
+    if report.get("local_index") is not False:
+        raise SmokeFailure("/readyz reports a local index although the smoke settings disable it")
+
+
 def check_opensearch(base: str, port: int) -> None:
     status, _, body = http_get(f"{base}/opensearch.xml")
     if status != 200:
@@ -436,6 +456,18 @@ def run_case(
             check_config(base)
             check_search(base, fake)
             check_opensearch(base, expected_port)
+            check_ready(base)
+            try:
+                mcp_smoke.run(
+                    binary,
+                    settings_path,
+                    case_dir,
+                    child_environment(env),
+                    QUERY,
+                    KNOWN_URL,
+                )
+            except mcp_smoke.McpSmokeError as error:
+                raise SmokeFailure(f"MCP session failed: {error}") from error
             if unused_port is not None and port_accepts(unused_port):
                 raise SmokeFailure(
                     f"settings port {unused_port} is listening; the override was ignored"

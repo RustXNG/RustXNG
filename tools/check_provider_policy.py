@@ -11,6 +11,10 @@ from provider_policy import GENERIC_MODULES, adapter_source, review_for
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# プロバイダーの条件は変わるので、記録が古いまま有効扱いされないようにする。
+# 期限切れは自動的な無効化ではなく、再確認を要求するエラーとして扱う。
+REVIEW_MAX_AGE_DAYS = 365
+
 
 def identity(engine: dict) -> dict:
     return {
@@ -64,8 +68,13 @@ def validate(settings: dict, policy: dict, pending: dict) -> list[str]:
                 if not review.get(field):
                     errors.append(f"{name}: reviewed provider needs {field}")
             try:
-                if date.fromisoformat(review.get("review_date", "")) > date.today():
+                reviewed_on = date.fromisoformat(review.get("review_date", ""))
+                if reviewed_on > date.today():
                     raise ValueError("future review date")
+                if (date.today() - reviewed_on).days > REVIEW_MAX_AGE_DAYS:
+                    errors.append(
+                        f"{name}: review is older than {REVIEW_MAX_AGE_DAYS} days; re-check the provider conditions"
+                    )
             except (TypeError, ValueError):
                 errors.append(f"{name}: valid non-future review_date required")
             if minimum := review.get("minimum_spacing_ms"):
@@ -87,7 +96,15 @@ def main() -> None:
     for profile in ("clean",):
         overlay = tomllib.loads((ROOT / f"settings.{profile}.toml").read_text(encoding="utf-8"))
         engines = {entry["name"]: entry for entry in overlay.get("engines", [])}
-        reviewed = {**settings, "engines": [{**entry, **engines.get(entry["name"], {})} for entry in settings["engines"]]}
+        if overlay.get("use_default_settings", True) is False:
+            # `use_default_settings = false` replaces the Standard engine set,
+            # so the profile runs exactly the engines its own file lists: none.
+            # Validating the merged Standard set here would check a
+            # configuration that never reaches the runtime.
+            base_engines: list[dict] = []
+        else:
+            base_engines = settings["engines"]
+        reviewed = {**settings, "engines": [{**entry, **engines.get(entry["name"], {})} for entry in base_engines]}
         for section in ("search", "outgoing"):
             reviewed[section] = {**settings.get(section, {}), **overlay.get(section, {})}
             if section == "outgoing":

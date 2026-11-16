@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import statistics
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -63,11 +65,19 @@ def hit_rank(urls: list[str], gold: list[str]) -> int | None:
     return first_hit_rank(urls[:10], gold)
 
 
-def restart_instance(binary: str, port: int, base: str) -> None:
-    """Stop whatever listens on the port, start the binary, wait for /healthz."""
-    import subprocess
-    import time as _time
+def restart_instance(binary: str, port: int, base: str, attempts: int = 40) -> None:
+    """Stop whatever listens on the port, start the binary and wait for /healthz.
 
+    Raises ValueError or RuntimeError instead of returning silently: a run that
+    kept going would measure whatever else answers on that port.
+    """
+    if not Path(binary).is_file():
+        raise ValueError(f"restart binary not found: {binary}")
+    if shutil.which("fuser") is None:
+        raise RuntimeError(
+            "restarting needs fuser (psmisc) to free the port; install it or "
+            "start the instance yourself and pass --base"
+        )
     # Kill whatever listens on the port. A pkill -f pattern would also match the
     # shell that launched this script (its command line contains the pattern).
     subprocess.run(
@@ -76,20 +86,29 @@ def restart_instance(binary: str, port: int, base: str) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    _time.sleep(1)
-    subprocess.Popen(
+    time.sleep(1)
+    process = subprocess.Popen(
         [binary, "--port", str(port)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    for _ in range(40):
-        _time.sleep(0.5)
+    for _ in range(attempts):
+        time.sleep(0.5)
+        code = process.poll()
+        if code is not None:
+            raise RuntimeError(
+                f"{binary} exited with {code} before becoming ready on port {port}"
+            )
         try:
             with urllib.request.urlopen(f"{base}/healthz", timeout=2) as response:
                 if response.status == 200:
                     return
         except Exception:  # noqa: BLE001 - still starting
             continue
+    process.kill()
+    raise RuntimeError(
+        f"{binary} did not answer {base}/healthz after {attempts * 0.5:.0f}s"
+    )
 
 
 def main() -> int:
@@ -125,12 +144,20 @@ def main() -> int:
     if args.restart_binary:
         # start a fresh instance for the first batch too
         base = f"http://127.0.0.1:{args.port}"
-        restart_instance(args.restart_binary, args.port, base)
+        try:
+            restart_instance(args.restart_binary, args.port, base)
+        except (ValueError, RuntimeError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
         print("  (started instance)", file=sys.stderr)
     for index, question in enumerate(questions):
         if args.restart_binary and index and index % args.restart_every == 0:
             base = f"http://127.0.0.1:{args.port}"
-            restart_instance(args.restart_binary, args.port, base)
+            try:
+                restart_instance(args.restart_binary, args.port, base)
+            except (ValueError, RuntimeError) as error:
+                print(f"error: {error}", file=sys.stderr)
+                return 2
             print(f"  (restarted instance at question {index})", file=sys.stderr)
         result = search(base, question["query"], extra, args.timeout, args.retain_payload)
         rank = hit_rank(result.get("urls") or [], question["gold"])
@@ -152,7 +179,7 @@ def main() -> int:
     latencies = [row["millis"] for row in rows]
     sizes = [row["bytes"] for row in rows if row.get("bytes")]
     report = {
-        "base": args.base,
+        "base": base,
         "params": extra,
         "questions": total,
         "hit@1": hits1,

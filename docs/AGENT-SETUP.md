@@ -90,7 +90,9 @@ The command runs in the foreground. If your execution environment requires a bac
 use its process-management facility or the user's existing service manager, record its identity,
 and keep stdout/stderr in a known log. Do not assume a process survives the end of your tool session.
 
-Poll `/healthz` for a bounded interval (for example, 30 seconds), then inspect `/config` and run step 4.
+Poll `/healthz` for a bounded interval (for example, 30 seconds), then check `/readyz`: it answers 503 when the profile has no engine and no local index, so a 200 from `/healthz` alone does not mean the instance can search. Inspect `/config` and run step 4.
+
+Before starting the service, `rustxng --check-config --profile <name>` reports the same readiness used by `/readyz` plus a `warnings` list (valid input that may still surprise the operator), and exits without binding a port; it is the cheapest way to catch a broken or unintended settings file.
 On failure, report the log and actual exit status. Avoid repeated installation or duplicate processes.
 
 For a temporary agent-owned background process, set `RUSTXNG_IDLE_TIMEOUT=300` so it exits after inactivity.
@@ -156,7 +158,7 @@ Version: <actual rustxng --version output>
 Binary: <absolute path, or unavailable for an existing remote service>
 Endpoint: http://127.0.0.1:<actual-port>
 Lifecycle: <reused service / process or service identity, and log location>
-Verified: /healthz, /config, and a nonempty JSON search with max_results=5
+Verified: /healthz, /readyz, /config, a nonempty JSON search with max_results=5, and one stdio MCP `search` call
 Search: <one command using the actual endpoint>
 ```
 

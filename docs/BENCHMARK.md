@@ -4,6 +4,21 @@
 
 RustXNG と上流 SearXNG（Python）を同じマシンで並べて測った結果です。
 
+## 現在の CI の範囲（2026-11-16）
+
+`nightly-bench`（`nightly-offline`）は外部プロバイダーへ問い合わせず、保存済みフィクスチャの再集計と
+台帳整合だけを検証します。かつて nightly で 100 問を実行し `tools/check_bench.py` の下限で落とす
+設計は、プロバイダー除外と利用条件の見直しにより停止しています。`check_bench.py` は現在、
+新しく取得した評価 JSON に対する手動・任意 CI のゲートとして残しています。
+
+`--restart-binary` を使うと一定問数ごとにプロセスを作り直せます（エンジン休止の持ち越しを避けるため）。ポートを解放する `fuser`（psmisc）が必要で、起動できない場合は測定を続けずに終了コード 2 で止まります。
+
+```bash
+python3 tools/eval_quality.py --base http://127.0.0.1:29483 \
+  --questions bench/quality-questions-100.json --delay 1.1 --json /tmp/run.json
+python3 tools/check_bench.py /tmp/run.json
+```
+
 ## 方法
 
 - 2 つのインスタンスを同じホストで同時に起動（RustXNG: `cargo run --release`、SearXNG: granian + WSGI）

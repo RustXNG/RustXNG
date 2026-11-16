@@ -3,6 +3,7 @@
 Bug reports, documentation, benchmarks, reviews, and code are welcome. 日本語・Englishどちらでも参加できます。
 You do not need repository access to contribute: fork the repository and open a PR.
 For sustained maintenance, see [GOVERNANCE.md](GOVERNANCE.md) and [MAINTAINERS.md](MAINTAINERS.md).
+The [documentation index](docs/README.md) lists the guides by purpose; design decisions and the current execution state live in [docs/engineering/](docs/engineering/).
 
 ## Choose the right place
 

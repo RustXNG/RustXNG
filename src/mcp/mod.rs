@@ -789,6 +789,35 @@ mod tests {
         McpServer::new(Arc::new(Searcher::new(settings).unwrap())).unwrap()
     }
 
+    /// `read_page` may only read URLs that `search` returned in the same
+    /// session, so the memory must be per server instance and bounded.
+    #[test]
+    fn remembered_urls_are_per_instance_and_bounded() {
+        let settings = crate::settings::Settings::defaults();
+        let first = server(settings.clone());
+        let second = server(settings);
+
+        first.remember(std::iter::once("https://example.test/rust".to_string()));
+        assert!(first.was_returned("https://example.test/rust"));
+        assert!(
+            !second.was_returned("https://example.test/rust"),
+            "a second server must not inherit another session memory"
+        );
+
+        // The memory is a ring: the oldest URL is the first one forgotten.
+        let urls: Vec<String> = (0..=REMEMBERED_URLS)
+            .map(|index| format!("https://example.test/{index}"))
+            .collect();
+        first.remember(urls.iter().cloned());
+        assert!(!first.was_returned(&urls[0]));
+        assert!(first.was_returned(&urls[REMEMBERED_URLS]));
+
+        // Re-remembering a URL keeps one entry instead of evicting a peer.
+        first.remember(std::iter::once(urls[1].clone()));
+        assert!(first.was_returned(&urls[1]));
+        assert!(first.was_returned(&urls[2]));
+    }
+
     fn args(query: &str) -> SearchArgs {
         SearchArgs {
             query: query.into(),

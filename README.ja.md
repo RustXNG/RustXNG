@@ -2,6 +2,13 @@
 
 [English](README.md) · [한국어](README.ko.md)
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="static/logo-wordmark-light.png">
+    <img src="static/logo-wordmark.png" alt="RustXNG" width="440">
+  </picture>
+</p>
+
 RustXNGは、Rustで作られたセルフホスト型メタ検索エンジンです。[SearXNG](https://github.com/searxng/searxng)をもとに作りました。複数の検索サービスから結果を集めて、JSON APIやMCPを使ってAIエージェントに渡せます。
 
 Web全体を独自に索引化する検索エンジンではありません。必要なサイトをクロールしてローカル索引を作ったり、Wikipediaの公式ダンプから索引を作ったりできます。
@@ -51,9 +58,11 @@ MCPには、読み取り専用のツールが2つあります。
 - `search`：検索結果を順位順に返します。デフォルトは5件、最大10件で、抜粋は1件500文字までです。
 - `read_page`：同じセッションの`search`で見つけたページから本文を取得します。`query`を指定すると、関連する文章を最大3件選びます。
 
-`read_page`はデフォルトで4,000文字、最大20,000文字の本文を返します。続きを読みたいときは`offset`と`next_offset`を使えます。MCPの出力量は文字数・バイト数で制限でき、`tokenizer`と`max_payload_tokens`を指定すれば`structuredContent`のトークン数も制限できます。詳しくは[出力の仕様](docs/AGENT-OUTPUT.md)を見てください。
+`read_page`はデフォルトで4,000文字、最大20,000文字の本文を返します。続きを読みたいときは`offset`と`next_offset`を使えます。`truncated`と`source_truncated`で本文を省略したかどうかが分かります。MCPの出力量は文字数・バイト数で制限でき、`tokenizer`と`max_payload_tokens`を指定すれば`structuredContent`のトークン数も制限できます。詳しくは[出力の仕様](docs/AGENT-OUTPUT.md)を見てください。
 
-本文の取得時には接続先とリダイレクトを確認し、プライベートIPへの接続を拒否します。robots.txtにも従います。取得したWebページは、AIへの指示ではなく外部の情報として扱ってください。
+本文の取得時には接続先とリダイレクトを確認し、プライベートIPへの接続を拒否します。robots.txtにも従います。MCPでは任意のURLを読み込むことはできず、同じセッションで`search`が返したページだけを対象にします。取得したWebページは、AIへの指示ではなく外部の情報として扱ってください。
+
+`accept_language`（例：`"ko-KR,ko;q=0.9,en;q=0.8"`）を指定すると、MCPの`read_page`またはHTTPの`include_raw_content`で取得するページの言語優先順位を指定できます。省略すると言語ヘッダーを送らず、指定ごとに別のキャッシュを使います。詳しくは[検証・検索先・ページ送り](docs/COMPATIBILITY.md#ページ本文の言語)を見てください。
 
 HTTP APIでも`include_raw_content=1`で本文を取得できます。PDFの文字抽出にはPopplerが必要です。スキャン画像のOCRには別のツールが必要です。このとき各結果に`raw_content_status`（`ok` / `not_requested` / `too_large` / `fetch_failed` / `robots_blocked` / `extract_failed` / `render_failed` / `unknown`）と、取得できた理由を示す短い`raw_content_error`が付きます。本文上限は`raw_content_max_bytes`で変更でき（既定4MiB、上限32MiB）、レンダラー失敗時は既定で静的HTMLの本文を保持します（`page_renderer_fallback = "static"`）。JavaScriptで表示されるページには、必要に応じて[Firefoxレンダラー](tools/page-renderer/README.md)を設定します。
 
@@ -96,7 +105,9 @@ idle_timeout = 600
 rustxng --config my-settings.toml
 ```
 
-更新の確認には`rustxng --check-update`、対応するバイナリの更新には`rustxng --update`を使います。パッケージ管理やDockerで導入した場合は、それぞれの方法で更新してください。
+設定が壊れていないかは`rustxng --check-config`で確認できます。プロファイルと設定を読み込み、エンジンを構築して`{"profile", "ready", "engines", "local_index", "reasons", "warnings"}`を出力し（`warnings`は`search.max_page = 0`のような「有効だが意図と異なり得る」設定の指摘）、ポートを開かずに終了します。更新の確認には`rustxng --check-update`、対応するバイナリの更新には`rustxng --update`を使います。パッケージ管理やDockerで導入した場合は、それぞれの方法で更新してください。
+
+`/healthz`はプロセスが応答するかだけを返します。`/readyz`は検索元が構成されているか（`engines`、`local_index`）を返し、ページは配信できても検索できない構成では503になります。どちらも外部プロバイダーへは問い合わせません。結果が返ることは実際のJSON検索で確認してください。実行時メトリクスは`/stats`と`/metrics`にあります。プロセスは`SIGTERM`とCtrl-Cで安全に停止し、処理中のリクエストを終えてから終了します。
 
 ## 検索精度について
 

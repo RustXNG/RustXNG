@@ -39,6 +39,8 @@ rdsh は SearXNG の JSON API を読むため、RustXNG は同じ形で応答し
 
 - `/search?q=...&format=json` の `results[]`（`title` / `url` / `content`）
 - `/healthz`（起動確認）
+- `/readyz`（検索元が構成されているか。外部へは問い合わせない）
+- `rustxng --check-config`（起動前の設定検証。同じ判定をソケットなしで返す）
 - `unresponsive_engines` は `[engine, 理由]` の配列
 
 2026-10-31 時点で、`rdsh search-web --engine rustxng --json` が RustXNG の応答をそのまま解釈できることを実機で確認しています。

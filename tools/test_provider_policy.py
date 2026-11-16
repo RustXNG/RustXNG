@@ -88,6 +88,23 @@ class ProviderPolicyTests(unittest.TestCase):
             del policy["providers"]["openstreetmap"][field]
             self.assertTrue(validate(self.settings, policy, self.pending), field)
 
+    def test_a_stale_review_asks_for_a_recheck(self) -> None:
+        from datetime import date, timedelta
+
+        name, review = next(
+            (name, review)
+            for name, review in self.policy["providers"].items()
+            if review.get("standard_allowed") is True
+        )
+        engine = next(
+            (entry for entry in self.settings["engines"] if entry.get("engine", entry["name"]) == name),
+            None,
+        )
+        self.assertIsNotNone(engine, f"no shipped engine uses {name}")
+        review["review_date"] = (date.today() - timedelta(days=400)).isoformat()
+        errors = " ".join(validate(self.settings, self.policy, self.pending))
+        self.assertIn("older than", errors)
+
 
 if __name__ == "__main__":
     unittest.main()
