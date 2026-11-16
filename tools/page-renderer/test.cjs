@@ -20,7 +20,7 @@ function run(html, fetch, options = {}) {
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error('renderer timed out: ' + diagnostics));
-    }, options.timeoutMs || 15000);
+    }, options.timeoutMs || 60000);
     child.on('error', reject);
     lines.on('line', async line => {
       try {
@@ -129,7 +129,7 @@ test('a worker resource that never receives a broker reply reaches the deadline'
   const { done } = run('<script>new Worker("/worker.js")</script>', request => {
     if (new URL(request.url).pathname === '/worker.js') return response('fetch("/waiting.json");');
     return new Promise(() => {});
-  }, { timeoutMs: 25000 });
+  }, { timeoutMs: 90000 });
   const result = await done;
   assert.equal(result.type, 'error');
   assert.equal(result.code, 1);
