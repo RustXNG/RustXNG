@@ -30,11 +30,26 @@ disable these reads because remote DNS cannot be validated by this client.
 Administrators should also enforce network egress restrictions for their deployment;
 application checks cannot control local routing or custom address translation.
 
+Engine requests use a separate client because an engine may legitimately be
+self-hosted. It applies the same per-hop rule: a redirect may stay on the
+engine's own origin (same scheme, host and port), and every other target has to
+be a public http(s) URL whose single DNS answer contains only global addresses.
+The host names of configured engine endpoints are the only exemption from that
+address rule, so a LAN engine keeps working while a redirect target does not
+inherit the exemption. Decoded engine response bodies are cut while streaming at
+8 MiB (previously unbounded), so one hostile or compromised upstream cannot
+inflate the process by the size of its reply.
+
 `server.secret_key` defaults to empty. At startup RustXNG replaces an empty key
 or the historical `ultrasecretkey` example with 32 cryptographically random bytes.
 The generated key lasts for that Searcher instance; signed media links expire on
 restart. For multiple workers or stable links, set your own shared random secret
 through the configuration or `SEARXNG_SECRET`. Signatures do not replace destination checks.
+
+`format=csv` prefixes a value that starts with `=`, `+`, `-`, `@`, a tab or a
+carriage return with an apostrophe, so a spreadsheet stores text instead of
+evaluating a formula taken from an engine title or snippet. The visible value is
+unchanged and other formats are unaffected.
 
 Offline regression tests exercise image, favicon, raw-content and research routes
 against owned local servers and injected DNS answers. They verify no TCP connections
