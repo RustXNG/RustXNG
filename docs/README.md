@@ -10,6 +10,7 @@ RustXNG の文書は目的別に分かれています。初めての場合は RE
 - [RDSH.md](RDSH.md): rdsh から使う場合の設定
 - [OBSERVABILITY.md](OBSERVABILITY.md): `/metrics` の系列、`/healthz`・`/readyz` との使い分け
 - [DEPENDENCIES.md](DEPENDENCIES.md): 依存のライセンス・禁止事項・取得元の検査（`deny.toml`）
+- [LIGHTWEIGHT.md](LIGHTWEIGHT.md): 既定 / 最小 / 全 feature の比較と既定を変えない判断
 
 ## 検索・索引
 

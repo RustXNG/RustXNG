@@ -56,6 +56,8 @@
 | N39 | P3 | `EngineStates` の `expect` が Mutex poison で全検索を panic させ、suspension 秒に上限が無かった | 修正済み（`unwrap_or_else(into_inner)`、`validate_suspension` で 1 年上限）+ テスト |
 | N40 | P2 | CSV のセルが `=+-@` で始まると表計算ソフトが数式として実行し得た（CWE-1236） | 修正済み（先頭アポストロフィで無害化）+ テスト（コミット済み） |
 | N41 | P2 | engine クライアントが DNS/リダイレクト/本文サイズを検証していなかった | 修正済み（`validated_resolver`、リダイレクト各段検証、8 MiB 上限）。設定済み engine ホストのみ例外 |
+| N43 | P1 | `src/i18n.rs`（2,985 行）と `src/wikidata_infobox.rs`（670 行）が未参照のデッドコードで、翻訳表と JSON 983 KB を同梱していた | 削除済み（参照・include・build.rs・テンプレート・公開 API を全確認）。src LOC 86,859→83,202、バイナリは −448 B（リンカが既に未使用 section を落としていた）、起動と RSS は不変 |
+| N44 | P2 | graceful shutdown の drain に期限が無く、`/research` 中は systemd/docker の猶予で強制終了され得た | 修正済み（`server.shutdown_grace` 既定 10 秒、期限後はランタイム停止で子プロセスも kill_on_drop）。SIGTERM の drain 内完了と期限超過の 2 テスト |
 | N42 | P3 | NOTICE に CDLA-Permissive-2.0（webpki-roots）が無く、`/about` に AGPL §13 の source リンクが無かった | 修正済み |
 | N36 | P3 | 文書内の相対リンクが実在するかを検査しておらず、移動・改名で静かに壊れ得た | 修正済み（`tools/test_doc_links.py`: README と docs/** の相対リンクを解決。初回実行で破損 0 件） |
 | N35 | P3 | 有効なまま意図と異なる設定（`max_page = 0`、非ループバックで limiter 無効、metrics 無効、research 有効で鍵なし）を診断する手段がなかった | 修正済み（`Settings::warnings`。`--check-config` の `warnings` と起動時ログに出す）+ 単体・CLI テスト |

@@ -32,6 +32,8 @@
 | 18 | src/diagnostics.rs, src/web/handlers.rs, src/main.rs | `fix(web): readiness follows the index that actually opened` |
 | 19 | src/engine/state.rs, src/settings.rs | `fix(engine): survive a poisoned state lock and bound suspension windows` |
 | 20 | examples/fusion_lab.rs, bench/local-retrieval/fusion-lab/ | `feat(eval): offline rank-fusion lab` |
+| 21 | src/i18n.rs, src/wikidata_infobox.rs, tools/import_translations.py, docs | `refactor: remove unused i18n and wikidata infobox modules` |
+| 22 | src/settings.rs, src/main.rs, tests/cli.rs | `feat(server): bound the shutdown drain with shutdown_grace` |
 
 整形のみの差分（src/results.rs など）は対応するコミットに混ぜず、`style:` として分けるか
 該当コミットの本文に rustfmt と明記する。

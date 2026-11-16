@@ -85,6 +85,10 @@
 54. fix(engine): Mutex poison 耐性と suspension の 1 年上限（テスト 1 件）
 55. Phase 4.3: オフライン融合実験（既存/RRF/正規化和/多様性、ablation と感度）— RRF は有意に悪く不採用、position 融合単独は solo に負けることを実測。ハーネスと再現可能 fixture を `examples/fusion_lab.rs` と `bench/local-retrieval/fusion-lab/` に収録
 
+56. Phase 3: デッドコード削除（`cc34686`）— i18n 2,985 行 + wikidata 670 行 + JSON 983 KB + 生成器。参照・include・build.rs・テンプレート・公開 API を確認し、削除前後を実測
+57. Phase 5.5: `server.shutdown_grace`（既定 10 秒）と drain watchdog（`71388da`）。SIGTERM の drain 内完了・期限超過の 2 テスト
+58. Phase 5.3: 既定 / 最小 / 全 feature の比較（`docs/LIGHTWEIGHT.md`）。依存 349 vs 286、バイナリ −23.8%、起動・RSS は同等。既定は変更しない判断
+
 ## 未完了・追跡
 
 - R3: エンジン側 pageno 演算は checked でない（入口上限で緩和）
