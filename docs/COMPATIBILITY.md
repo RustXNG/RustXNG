@@ -97,7 +97,7 @@ curl --fail --get 'http://127.0.0.1:29483/search' \
 - 上流との実測比較（速度・結果一致度）: [BENCHMARK.md](BENCHMARK.md) と `bench/compare.py`
 - エンジン網羅率: `python3 tools/coverage.py /path/to/searxng`
 - リクエストボディ: 64 KiB を超える POST（`/search`、`/preferences`）は 413 で拒否します（axum 既定の 2 MiB より厳しくしています）。`format=json` を指定していれば、ボディ超過やクエリ文字列の不正（例: `pageno=abc`）も `{"error": ...}` の JSON で返します。
-- 本文抽出: `cargo test --locked --test extraction`。`tests/fixtures/extraction/` の HTML と `manifest.json` が、各ページで残すべき文字列・残してはいけない文字列（ナビ、フッター、非表示要素）・最小文字数を宣言します。ネットワークは使いません。
+- 本文抽出: `cargo test --locked --test extraction`。`tests/fixtures/extraction/` の 30 ページ（すべて合成 HTML）と `manifest.json` が、各ページで残すべき文字列・残してはいけない文字列（ナビ、フッター、非表示要素）・最小文字数を宣言します。ネットワークは使いません。
 
 ## 完全互換に近づけるには
 

@@ -58,20 +58,66 @@ python3 tools/eval_quality.py --base http://127.0.0.1:29558 \
 
 ## 本文抽出のコーパス（2026-11-17）
 
-`tests/fixtures/extraction/` に 5 ページ（英語ドキュメント・数式・日本語・RFC 風・ニュース）と `manifest.json` を
-追加し、`cargo test --locked --test extraction` で検証する。ネットワーク不要。
+`tests/fixtures/extraction/` に 30 ページと `manifest.json` を置き、`cargo test --locked --test extraction` で
+検証する。ネットワーク不要。全ページが合成 HTML（自作の文章・架空の製品名・架空の数値）で、実在サイトの本文は
+含まない。
 
-| fixture | 抽出文字数 | 句読点前の余白 |
-| --- | ---: | ---: |
-| docs-page.html（表・コード・脚注） | 462 | 0 |
-| math-page.html（KaTeX / MathML） | 121 | 0 |
-| ja-docs.html（日本語・dl・表） | 210 | 0 |
-| rfc-page.html（ヘッダー表） | 235 | 0 |
-| news-page.html（nav/footer/hidden/aria） | 133 | 0 |
+| fixture | 抽出文字数 | 句読点前の余白 | 主な論点 |
+| --- | ---: | ---: | --- |
+| docs-page.html | 462 | 0 | 表・コード・脚注 |
+| math-page.html | 121 | 0 | KaTeX / MathML |
+| ja-docs.html | 210 | 0 | 日本語・dl・表 |
+| rfc-page.html | 235 | 0 | ヘッダー表 |
+| news-page.html | 133 | 0 | nav/footer/hidden/aria |
+| tech-docs-tabs.html | 814 | 0 | タブ付き技術文書・引用 |
+| news-longform.html | 698 | 0 | 記事内 nav・引き込み引用 |
+| academic-paper.html | 1125 | 0 | 学術風・文献リスト・脚注番号 |
+| github-readme.html | 529 | 0 | README 風・バッジ・コード |
+| table-finance.html | 526 | 0 | caption/thead/tfoot の表 |
+| code-blocks-langs.html | 658 | 0 | 4 言語のコードブロック |
+| math-equations.html | 388 | 0 | 数式の二重描画・注釈なし MathML |
+| ja-tech-blog.html | 323 | 0 | 日本語ブログ・aside 補足 |
+| ko-manual.html | 385 | 0 | 韓国語マニュアル・表 |
+| multilingual-spec.html | 590 | 0 | en/ja/ko/zh/de の併記 |
+| broken-html.html | 222 | 0 | 閉じない p / b / ul |
+| nav-heavy.html | 487 | 0 | メガメニュー・パンくず・ページ送り |
+| ads-cookie-banner.html | 435 | 0 | 記事内の広告・クッキー・購読誘導 |
+| quotes-footnotes.html | 615 | 0 | blockquote の帰属・脚注リンク |
+| definition-list.html | 565 | 0 | dl/dt/dd の入れ子 |
+| image-captions.html | 565 | 0 | figure / figcaption |
+| docs-api-reference.html | 635 | 0 | API リファレンス・引数表 |
+| recipe-page.html | 822 | 0 | レシピ・時間表・Tip |
+| forum-thread.html | 590 | 0 | 掲示板風・post 内 footer |
+| single-page-no-semantic-tags.html | 417 | 0 | article なしの body fallback |
+| wikipedia-style.html | 797 | 0 | infobox 表・hatnote |
+| dataset-pre-table.html | 528 | 0 | CSV（pre）と th なし表 |
+| changelog-page.html | 500 | 0 | チェンジログ・版ごとの list |
+| tutorial-steps.html | 930 | 0 | 手順・SQL・警告 aside |
+| huge-document.html | 100776 | 0 | 400 段落の巨大文書 |
 
-manifest は「残す文字列（表の行・コード行・脚注本文など）」「残してはいけない文字列（nav・footer・hidden・aria-hidden）」
-「最小文字数」を宣言し、テストが全 fixture を網羅していることも検査する。この 5 ページは合成 fixture であり、
-実サイトの分布を代表しない。実ページ 2 件の A/B は次の節に記録する。
+manifest は「残す文字列（表の行・コード行・脚注本文など）」「残してはいけない文字列（nav・footer・hidden・aria-hidden、
+記事内の広告・クッキー・購読誘導）」「最小文字数」を宣言し、テストが全 fixture を網羅していることも検査する。
+fixture は合成であり、実サイトの分布を代表しない。実ページ 2 件の A/B は次の節に記録する。
+
+同じ 30 ページを debug ビルドで 200 回（巨大文書のみ 20 回）抽出し、`main_text_limited` の 1 回あたりの時間を測った
+（HTML パースは対象外、共有 target dir、1 プロセス内）。中央値は約 168 µs、最小 42 µs（news-page.html）、
+最大 320 µs（recipe-page.html）、100,776 字の巨大文書は 13.5 ms。件数を 5 から 30 に増やしても、
+1 ページあたりの費用はページ規模に比例する範囲に収まっている。
+
+## 本文抽出の変化（Phase 4.5 / Agent E、2026-11-17）
+
+コーパスを 30 ページへ広げたとき、fixture 上で 2 件の欠落を検出した。どちらも fixture が先に落ち、実装を直すと
+通る形で確認している（`src/content.rs` の単体テスト 2 件を追加）。
+
+| fixture | 文字数（前→後） | 1 回あたり（前→後） | 内容 |
+| --- | ---: | ---: | --- |
+| ads-cookie-banner.html | 588 → 435 | 142 → 119 µs | 記事内の広告・購読誘導（class="ad-slot" など）を本文から外す |
+| quotes-footnotes.html | 581 → 615 | 156 → 180 µs | blockquote / figure 内の `<footer>`（引用の帰属）を残す |
+
+- **広告・同意・購読**: 構造シグナル（`role`・`hidden`）だけでなく、`class` / `id` の語（`ad`・`advert`・`cookie`・
+  `consent`・`gdpr`・`newsletter`・`sponsor` など）でも外す。`related` や `social` は本文にも現れるため対象外のまま。
+- **引用の帰属**: `footer` は原則ページクロームだが、`blockquote` / `figure` の内側にあるものは引用元の表記なので残す。
+  記事直下のタグ列 footer は従来どおり落ちる（既存テストを変更していない）。
 
 ## 本文抽出の変化（Phase 4.5、2026-11-16）
 

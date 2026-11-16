@@ -141,7 +141,9 @@ fn collect_text(element: ElementRef<'_>, out: &mut Vec<Segment>) {
             "pre" => out.push(Segment::Pre(preformatted_text(element))),
             "table" => out.push(Segment::Pre(render_table(element))),
             "math" => out.push(Segment::Flow(math_text(element))),
-            _ if repeats_a_formula(&element) || is_page_chrome(&element) => {}
+            _ if repeats_a_formula(&element)
+                || is_page_chrome(&element)
+                || is_boilerplate(&element) => {}
             _ if BLOCKS.contains(&name) => {
                 out.push(Segment::Break);
                 stack.push(Step::Break);
@@ -157,7 +159,10 @@ fn collect_text(element: ElementRef<'_>, out: &mut Vec<Segment>) {
 /// `related` or `social` also appear in legitimate prose.
 fn is_page_chrome(element: &ElementRef<'_>) -> bool {
     let value = element.value();
-    if matches!(value.name(), "nav" | "footer") {
+    if value.name() == "nav" {
+        return true;
+    }
+    if value.name() == "footer" && !attributes_a_quotation(element) {
         return true;
     }
     if value.attr("hidden").is_some() {
@@ -174,6 +179,47 @@ fn is_page_chrome(element: &ElementRef<'_>) -> bool {
             role.to_ascii_lowercase().as_str(),
             "navigation" | "banner" | "contentinfo" | "search"
         )
+    })
+}
+
+/// A `<footer>` inside a quotation or a figure is the attribution of that
+/// block rather than the footer of the page, so it is part of the text.
+fn attributes_a_quotation(element: &ElementRef<'_>) -> bool {
+    element
+        .ancestors()
+        .filter_map(|node| node.value().as_element())
+        .any(|ancestor| matches!(ancestor.name(), "blockquote" | "figure"))
+}
+
+/// Names that mark advertising, a consent banner or a subscription box. They
+/// are unambiguous where words such as `related` or `social` also appear in
+/// legitimate prose, so only these are matched against `class` and `id`.
+const BOILERPLATE_NAMES: &[&str] = &[
+    "ad",
+    "ads",
+    "adslot",
+    "advert",
+    "advertisement",
+    "sponsor",
+    "sponsored",
+    "cookie",
+    "consent",
+    "gdpr",
+    "newsletter",
+    "subscribe",
+];
+
+/// An advertising, consent or subscription block that no structural signal
+/// marks: pages name these in `class` and `id` instead of using `role`.
+fn is_boilerplate(element: &ElementRef<'_>) -> bool {
+    ["class", "id"].iter().any(|attribute| {
+        element.value().attr(attribute).is_some_and(|names| {
+            names.split_whitespace().any(|name| {
+                name.split('-').next().is_some_and(|head| {
+                    BOILERPLATE_NAMES.contains(&head.to_ascii_lowercase().as_str())
+                })
+            })
+        })
     })
 }
 
@@ -531,6 +577,42 @@ mod tests {
         assert!(text.contains("Ownership is the core idea."), "{text}");
         assert!(!text.contains("menu"), "{text}");
         assert!(!text.contains("site footer"), "{text}");
+    }
+
+    #[test]
+    fn a_footer_inside_a_quotation_is_attribution_not_page_chrome() {
+        let html = Html::parse_document(
+            "<html><body><article><figure><blockquote><p>Quoted.</p>\
+             <footer>— A. Editor, <cite>Notes on Style</cite>, 1998</footer></blockquote></figure>\
+             <footer>tags: rust</footer></article><footer>site footer</footer></body></html>",
+        );
+        let text = main_text(&html);
+        assert!(text.contains("— A. Editor, Notes on Style, 1998"), "{text}");
+        assert!(!text.contains("tags: rust"), "{text}");
+        assert!(!text.contains("site footer"), "{text}");
+    }
+
+    #[test]
+    fn named_advertising_consent_and_subscription_blocks_are_not_readable_text() {
+        let html = Html::parse_document(
+            "<html><body><article><p>Body</p>\
+             <div class=\"ad-slot\">Buy the widget</div>\
+             <aside class=\"newsletter-signup\">Subscribe weekly</aside>\
+             <div id=\"cookie-banner\">We use cookies</div>\
+             <div class=\"sponsor\">Sponsored by WidgetCo</div>\
+             <div class=\"advice\">Advice stays.</div></article></body></html>",
+        );
+        let text = main_text(&html);
+        assert!(text.contains("Body"), "{text}");
+        assert!(text.contains("Advice stays."), "{text}");
+        for dropped in [
+            "Buy the widget",
+            "Subscribe weekly",
+            "We use cookies",
+            "Sponsored by WidgetCo",
+        ] {
+            assert!(!text.contains(dropped), "{dropped} kept: {text}");
+        }
     }
 
     #[test]
