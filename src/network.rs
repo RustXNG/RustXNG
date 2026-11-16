@@ -369,25 +369,38 @@ impl Network {
             .transpose()?;
         // The fast path needs no request lock. On a miss, only one caller for
         // this cache and full request identity contacts the origin at a time.
-        let _request_guard = if let (Some(cache), Some(key)) = (cache, cache_key.as_deref()) {
-            if let Some(cached) = tokio::time::timeout_at(deadline, cache.get(key))
-                .await
-                .map_err(|_| NetworkError::Timeout)?
-            {
-                return Ok(cached_response(cached));
-            }
-            let guard = tokio::time::timeout_at(deadline, cache.request_lock(key).lock_owned())
-                .await
-                .map_err(|_| NetworkError::Timeout)?;
-            // A previous caller may have populated the cache while we waited.
-            if let Some(cached) = tokio::time::timeout_at(deadline, cache.get(key))
-                .await
-                .map_err(|_| NetworkError::Timeout)?
-            {
-                debug!(url = %request.url, "cache hit");
-                return Ok(cached_response(cached));
-            }
-            Some(guard)
+        let (_request_guard, mut stale) =
+            if let (Some(cache), Some(key)) = (cache, cache_key.as_deref()) {
+                if let Some(cached) = tokio::time::timeout_at(deadline, cache.get(key))
+                    .await
+                    .map_err(|_| NetworkError::Timeout)?
+                {
+                    return Ok(cached_response(cached));
+                }
+                let guard =
+                    tokio::time::timeout_at(deadline, cache.request_lock(key).lock_owned())
+                        .await
+                        .map_err(|_| NetworkError::Timeout)?;
+                // A previous caller may have populated the cache while we waited.
+                if let Some(cached) = tokio::time::timeout_at(deadline, cache.get(key))
+                    .await
+                    .map_err(|_| NetworkError::Timeout)?
+                {
+                    debug!(url = %request.url, "cache hit");
+                    return Ok(cached_response(cached));
+                }
+                // An expired entry is still stored: its validators let the
+                // origin answer 304 instead of resending the whole body.
+                let stale = tokio::time::timeout_at(deadline, cache.get_with_stale(key))
+                    .await
+                    .map_err(|_| NetworkError::Timeout)?;
+                (Some(guard), stale)
+            } else {
+                (None, None)
+            };
+        // Only GET requests are revalidated; POST results are refetched.
+        let revalidation = if request.method == Method::Get {
+            stale.as_ref().and_then(Revalidation::from_stale)
         } else {
             None
         };
@@ -401,7 +414,13 @@ impl Network {
             }
             let outcome = match tokio::time::timeout_at(
                 deadline,
-                self.send(client.clone(), &request, remaining, max_bytes),
+                self.send(
+                    client.clone(),
+                    &request,
+                    remaining,
+                    max_bytes,
+                    revalidation.as_ref(),
+                ),
             )
             .await
             {
@@ -410,6 +429,22 @@ impl Network {
             };
             match outcome {
                 Ok(response) => {
+                    if response.status == 304 && revalidation.is_some() {
+                        // The origin confirms the stale body is unchanged:
+                        // extend its TTL and reuse it without a download.
+                        if let Some(stale) = stale.take() {
+                            if let (Some(cache), Some(key)) = (cache, cache_key.as_deref()) {
+                                if tokio::time::timeout_at(deadline, cache.refresh(key))
+                                    .await
+                                    .is_err()
+                                {
+                                    debug!(url = %request.url, "cache refresh timed out");
+                                }
+                            }
+                            debug!(url = %request.url, "304 not modified, reusing cached response");
+                            return Ok(cached_response(stale));
+                        }
+                    }
                     if let (Some(cache), Some(key)) = (cache, cache_key.as_deref()) {
                         if response.status == 200
                             && !response.body.is_empty()
@@ -422,6 +457,11 @@ impl Network {
                                         final_url: response.final_url.clone(),
                                         headers: response.headers.clone(),
                                         body: std::sync::Arc::new(response.body.clone()),
+                                        etag: validator(&response.headers, "etag"),
+                                        last_modified: validator(
+                                            &response.headers,
+                                            "last-modified",
+                                        ),
                                     },
                                 ),
                             )
@@ -435,9 +475,12 @@ impl Network {
                     // a good engine (Yahoo! JAPAN, Bing) alive instead of
                     // suspending it for minutes.
                     if response.status == 429 && attempt <= self.retries {
-                        let backoff = Duration::from_millis(700);
+                        // Retry-After を尊重する（RFC 9110）。無ければ従来どおり 700ms。
+                        // 上流の制限を回避するためではなく、指示された時間だけ待つ。
+                        let backoff = parse_retry_after(&response.headers)
+                            .unwrap_or(Duration::from_millis(700));
                         if tokio::time::Instant::now() + backoff < deadline {
-                            debug!(url = %request.url, "rate limited, retrying after a pause");
+                            debug!(url = %request.url, ?backoff, "rate limited, retrying after Retry-After pause");
                             tokio::time::sleep(backoff).await;
                             continue;
                         }
@@ -477,6 +520,7 @@ impl Network {
         request: &EngineRequest,
         timeout: Duration,
         max_bytes: Option<usize>,
+        revalidation: Option<&Revalidation>,
     ) -> Result<EngineResponse, NetworkError> {
         let method = match request.method {
             Method::Get => reqwest::Method::GET,
@@ -503,6 +547,19 @@ impl Network {
                 .join("; ");
             if let Ok(value) = HeaderValue::from_str(&cookie) {
                 headers.insert(reqwest::header::COOKIE, value);
+            }
+        }
+
+        if let Some(revalidation) = revalidation {
+            if let Some(etag) = &revalidation.etag {
+                if let Ok(value) = HeaderValue::from_str(etag) {
+                    headers.insert(reqwest::header::IF_NONE_MATCH, value);
+                }
+            }
+            if let Some(last_modified) = &revalidation.last_modified {
+                if let Ok(value) = HeaderValue::from_str(last_modified) {
+                    headers.insert(reqwest::header::IF_MODIFIED_SINCE, value);
+                }
             }
         }
 
@@ -571,6 +628,51 @@ fn cached_response(cached: CachedResponse) -> EngineResponse {
         headers: cached.headers,
         body: cached.body.as_ref().clone(),
     }
+}
+
+/// Validators from a stale cache entry, sent as conditional GET headers.
+struct Revalidation {
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+impl Revalidation {
+    fn from_stale(stale: &CachedResponse) -> Option<Self> {
+        let etag = stale.etag.clone().filter(|value| !value.is_empty());
+        let last_modified = stale.last_modified.clone().filter(|value| !value.is_empty());
+        if etag.is_none() && last_modified.is_none() {
+            None
+        } else {
+            Some(Self {
+                etag,
+                last_modified,
+            })
+        }
+    }
+}
+
+/// A cache validator from a response header, when present and non-empty.
+fn validator(headers: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// `Retry-After`（RFC 9110 §10.2.3）を待機時間に変換する。
+///
+/// 秒数形式（`"120"`）に対応する。HTTP-date 形式は手軽に解釈できないため
+/// パース不能扱いとし、呼び出し側のフォールバック（700ms）に任せる。
+/// 異常に大きい値は 60 秒に頭打ちにする（サーバー設定ミスや悪意ある値で
+/// 起動を長時間止めない。deadline が尽きればそもそもリトライしない）。
+///
+/// これは「待つべき秒数」のヒントであり、上流への礼儀（制限を尊重し、
+/// 規制を回避しない）を守るためのもの。リトライ回数は増やさない。
+fn parse_retry_after(headers: &BTreeMap<String, String>) -> Option<Duration> {
+    let value = headers.get("retry-after")?.trim();
+    let secs: u64 = value.parse().ok()?;
+    Some(Duration::from_secs(secs.min(60)))
 }
 
 fn request_cache_key(request: &EngineRequest, proxy: Option<&str>) -> Result<String, NetworkError> {
@@ -837,6 +939,419 @@ mod tests {
             .unwrap();
         assert_eq!(response.text(), "safesearch=strict|en|");
         assert_eq!(calls.load(Ordering::Relaxed), 5);
+        server.abort();
+    }
+
+    /// (If-None-Match, If-Modified-Since) as seen by a test origin.
+    type ConditionalHeaders = (Option<String>, Option<String>);
+
+    /// Conditional request headers observed by a test origin.
+    #[derive(Clone, Default)]
+    struct Observed(std::sync::Arc<std::sync::Mutex<Vec<ConditionalHeaders>>>);
+
+    impl Observed {
+        fn record(&self, headers: &HeaderMap) {
+            let value = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            };
+            self.0
+                .lock()
+                .unwrap()
+                .push((value("if-none-match"), value("if-modified-since")));
+        }
+
+        fn at(&self, index: usize) -> ConditionalHeaders {
+            self.0.lock().unwrap()[index].clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn not_modified_reuses_the_stale_body_and_extends_the_ttl() {
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Router};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Observed::default();
+        let counter = Arc::clone(&hits);
+        let seen = observed.clone();
+        let app = Router::new().route(
+            "/",
+            get(move |headers: HeaderMap| {
+                let counter = Arc::clone(&counter);
+                let seen = seen.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    seen.record(&headers);
+                    if headers.contains_key("if-none-match") {
+                        axum::http::StatusCode::NOT_MODIFIED.into_response()
+                    } else {
+                        (
+                            [
+                                (axum::http::header::ETAG, "\"v1\""),
+                                (
+                                    axum::http::header::LAST_MODIFIED,
+                                    "Thu, 01 Jan 2026 00:00:00 GMT",
+                                ),
+                            ],
+                            "content-v1",
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let network = Network::from_settings(&Settings::defaults()).unwrap();
+        let cache = Cache::memory(Duration::from_millis(250), 8 * 1024 * 1024);
+
+        let first = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.text(), "content-v1");
+        assert_eq!(observed.at(0), (None, None));
+
+        // Let the entry expire so the next fetch revalidates.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let second = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.text(), "content-v1");
+        assert_eq!(
+            observed.at(1),
+            (
+                Some("\"v1\"".into()),
+                Some("Thu, 01 Jan 2026 00:00:00 GMT".into())
+            )
+        );
+
+        // The 304 extended the TTL, so this one is a plain cache hit.
+        let third = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.text(), "content-v1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn entries_without_validators_are_refetched_in_full() {
+        use axum::{routing::get, Router};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Observed::default();
+        let counter = Arc::clone(&hits);
+        let seen = observed.clone();
+        let app = Router::new().route(
+            "/",
+            get(move |headers: HeaderMap| {
+                let counter = Arc::clone(&counter);
+                let seen = seen.clone();
+                async move {
+                    let hit = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    seen.record(&headers);
+                    format!("content-v{hit}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let network = Network::from_settings(&Settings::defaults()).unwrap();
+        let cache = Cache::memory(Duration::from_millis(250), 8 * 1024 * 1024);
+
+        let first = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.text(), "content-v1");
+        assert_eq!(observed.at(0), (None, None));
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let second = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.text(), "content-v2");
+        // Without validators there is nothing to revalidate with.
+        assert_eq!(observed.at(1), (None, None));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn last_modified_alone_sends_if_modified_since() {
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Router};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Observed::default();
+        let counter = Arc::clone(&hits);
+        let seen = observed.clone();
+        let app = Router::new().route(
+            "/",
+            get(move |headers: HeaderMap| {
+                let counter = Arc::clone(&counter);
+                let seen = seen.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    seen.record(&headers);
+                    if headers.contains_key("if-modified-since") {
+                        axum::http::StatusCode::NOT_MODIFIED.into_response()
+                    } else {
+                        (
+                            [(
+                                axum::http::header::LAST_MODIFIED,
+                                "Thu, 01 Jan 2026 00:00:00 GMT",
+                            )],
+                            "content-v1",
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let network = Network::from_settings(&Settings::defaults()).unwrap();
+        let cache = Cache::memory(Duration::from_millis(250), 8 * 1024 * 1024);
+
+        let first = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.text(), "content-v1");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let second = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.text(), "content-v1");
+        assert_eq!(
+            observed.at(1),
+            (None, Some("Thu, 01 Jan 2026 00:00:00 GMT".into()))
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn both_validators_are_sent_and_new_content_replaces_the_cache() {
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Router};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Observed::default();
+        let counter = Arc::clone(&hits);
+        let seen = observed.clone();
+        let app = Router::new().route(
+            "/",
+            get(move |headers: HeaderMap| {
+                let counter = Arc::clone(&counter);
+                let seen = seen.clone();
+                async move {
+                    let hit = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    seen.record(&headers);
+                    let if_none_match =
+                        headers.get("if-none-match").and_then(|v| v.to_str().ok());
+                    if if_none_match == Some("\"v2\"") {
+                        axum::http::StatusCode::NOT_MODIFIED.into_response()
+                    } else if hit == 1 {
+                        (
+                            [
+                                (axum::http::header::ETAG, "\"v1\""),
+                                (
+                                    axum::http::header::LAST_MODIFIED,
+                                    "Thu, 01 Jan 2026 00:00:00 GMT",
+                                ),
+                            ],
+                            "content-v1",
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            [
+                                (axum::http::header::ETAG, "\"v2\""),
+                                (
+                                    axum::http::header::LAST_MODIFIED,
+                                    "Fri, 02 Jan 2026 00:00:00 GMT",
+                                ),
+                            ],
+                            "content-v2",
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let network = Network::from_settings(&Settings::defaults()).unwrap();
+        let cache = Cache::memory(Duration::from_millis(250), 8 * 1024 * 1024);
+
+        let first = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.text(), "content-v1");
+        assert_eq!(observed.at(0), (None, None));
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let second = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        // The content changed: both validators go out and the new body wins.
+        assert_eq!(second.text(), "content-v2");
+        assert_eq!(
+            observed.at(1),
+            (
+                Some("\"v1\"".into()),
+                Some("Thu, 01 Jan 2026 00:00:00 GMT".into())
+            )
+        );
+
+        // The replacement kept its own validators for the next revalidation.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let third = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.text(), "content-v2");
+        assert_eq!(
+            observed.at(2),
+            (
+                Some("\"v2\"".into()),
+                Some("Fri, 02 Jan 2026 00:00:00 GMT".into())
+            )
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_fully_cleared_cache_fetches_without_conditional_headers() {
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Router};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Observed::default();
+        let counter = Arc::clone(&hits);
+        let seen = observed.clone();
+        let app = Router::new().route(
+            "/",
+            get(move |headers: HeaderMap| {
+                let counter = Arc::clone(&counter);
+                let seen = seen.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    seen.record(&headers);
+                    (
+                        [(axum::http::header::ETAG, "\"v1\"")],
+                        "content-v1",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let network = Network::from_settings(&Settings::defaults()).unwrap();
+        let cache = Cache::memory(Duration::from_millis(250), 8 * 1024 * 1024);
+
+        let first = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.text(), "content-v1");
+        assert_eq!(observed.at(0), (None, None));
+
+        // Nothing is left to revalidate after the entry is gone: the fetch
+        // behaves exactly like the pre-conditional-GET path.
+        cache.clear().await;
+        let second = network
+            .fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.text(), "content-v1");
+        assert_eq!(observed.at(1), (None, None));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
         server.abort();
     }
 
@@ -1186,4 +1701,88 @@ mod tests {
             .await;
         assert!(matches!(result, Err(NetworkError::Timeout)));
     }
+    // -------------------------------------------------------------------------
+    // Retry-After（429 の待機時間の指示。RFC 9110 §10.2.3）
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn retry_after_seconds_is_honoured() {
+        let mut headers = BTreeMap::new();
+        headers.insert("retry-after".to_string(), "3".to_string());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn retry_after_is_capped_at_a_minute() {
+        let mut headers = BTreeMap::new();
+        // サーバー設定ミスや悪意ある値で起動を長時間止めない。
+        headers.insert("retry-after".to_string(), "86400".to_string());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn retry_after_http_date_falls_back() {
+        let mut headers = BTreeMap::new();
+        // HTTP-date 形式は解釈しない。呼び出し側の 700ms フォールバックに任せる。
+        headers.insert(
+            "retry-after".to_string(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn retry_after_missing_is_none() {
+        assert_eq!(parse_retry_after(&BTreeMap::new()), None);
+        let mut headers = BTreeMap::new();
+        headers.insert("retry-after".to_string(), "".to_string());
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    /// 429 + Retry-After: 0 なら即リトライして成功する（待機なしで 1 回だけやり直す）。
+    #[tokio::test]
+    async fn rate_limited_request_retries_once() {
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Router};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/",
+            get(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [(axum::http::header::RETRY_AFTER, "0")],
+                        )
+                            .into_response()
+                    } else {
+                        "ok".into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let network = Network::from_settings(&Settings::defaults()).unwrap();
+        let response = network
+            .fetch(
+                EngineRequest::get(format!("http://{addr}/")),
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "429 のあと 1 回だけリトライする");
+        server.abort();
+    }
+
 }

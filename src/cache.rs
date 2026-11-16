@@ -17,6 +17,10 @@ pub struct CachedResponse {
     pub final_url: String,
     pub headers: std::collections::BTreeMap<String, String>,
     pub body: std::sync::Arc<Vec<u8>>,
+    /// `ETag` validator from the origin, kept for conditional revalidation.
+    pub etag: Option<String>,
+    /// `Last-Modified` validator from the origin, kept for revalidation.
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,25 +84,40 @@ impl ResponseCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Return a fresh entry. An expired entry counts as a miss but stays
+    /// stored so `get_with_stale` can revalidate it with the origin.
     pub fn get(&self, key: &str) -> Option<CachedResponse> {
-        let mut inner = self.lock();
-        let expired = inner
-            .entries
-            .get(key)
-            .map(|entry| entry.stored.elapsed() > self.ttl)
-            .unwrap_or(false);
-        if expired {
-            self.remove_locked(&mut inner, key);
-            self.miss.fetch_add(1, Ordering::Relaxed);
-            return None;
+        let inner = self.lock();
+        match inner.entries.get(key) {
+            Some(entry) if entry.stored.elapsed() <= self.ttl => {
+                self.hit.fetch_add(1, Ordering::Relaxed);
+                Some(entry.response.clone())
+            }
+            _ => {
+                self.miss.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
-        if let Some(entry) = inner.entries.get(key) {
-            let response = entry.response.clone();
-            self.hit.fetch_add(1, Ordering::Relaxed);
-            Some(response)
-        } else {
-            self.miss.fetch_add(1, Ordering::Relaxed);
-            None
+    }
+
+    /// Return the entry even when its TTL elapsed, for conditional
+    /// revalidation. Counters stay untouched; callers decide how a stale
+    /// lookup is counted.
+    pub fn get_with_stale(&self, key: &str) -> Option<CachedResponse> {
+        let inner = self.lock();
+        inner.entries.get(key).map(|entry| entry.response.clone())
+    }
+
+    /// Extend the TTL of an existing entry after a 304 revalidation.
+    /// Returns whether the entry was still stored.
+    pub fn refresh(&self, key: &str) -> bool {
+        let mut inner = self.lock();
+        match inner.entries.get_mut(key) {
+            Some(entry) => {
+                entry.stored = Instant::now();
+                true
+            }
+            None => false,
         }
     }
 
@@ -173,6 +192,8 @@ mod tests {
             final_url: "https://example.com/".into(),
             headers: Default::default(),
             body: std::sync::Arc::new(body.as_bytes().to_vec()),
+            etag: None,
+            last_modified: None,
         }
     }
 
@@ -214,6 +235,27 @@ mod tests {
         let cache = ResponseCache::new(Duration::from_secs(60), 16);
         cache.set("key", response(&"x".repeat(100)));
         assert!(cache.get("key").is_none());
+    }
+
+    #[test]
+    fn expired_entries_are_kept_for_revalidation() {
+        let cache = ResponseCache::new(Duration::from_millis(0), 1024);
+        cache.set("key", response("x"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(cache.get("key").is_none());
+        let stale = cache.get_with_stale("key").expect("stale entry");
+        assert_eq!(stale.body.as_slice(), b"x");
+    }
+
+    #[test]
+    fn refresh_extends_the_ttl_of_an_entry() {
+        let cache = ResponseCache::new(Duration::from_millis(200), 1024);
+        cache.set("key", response("x"));
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(cache.get("key").is_none());
+        assert!(cache.refresh("key"));
+        assert!(cache.get("key").is_some());
+        assert!(!cache.refresh("missing"));
     }
 }
 
@@ -291,6 +333,24 @@ impl Cache {
         match &self.backend {
             CacheBackend::Memory(cache) => cache.set(key, response),
             CacheBackend::Valkey(cache) => cache.set(key, response).await,
+        }
+    }
+
+    /// Like `get`, but an expired entry is also returned so its validators
+    /// can be revalidated with a conditional request.
+    pub async fn get_with_stale(&self, key: &str) -> Option<CachedResponse> {
+        match &self.backend {
+            CacheBackend::Memory(cache) => cache.get_with_stale(key),
+            CacheBackend::Valkey(cache) => cache.get_with_stale(key).await,
+        }
+    }
+
+    /// Extend the TTL of an existing entry after a 304 revalidation.
+    /// Returns whether the entry was still stored.
+    pub async fn refresh(&self, key: &str) -> bool {
+        match &self.backend {
+            CacheBackend::Memory(cache) => cache.refresh(key),
+            CacheBackend::Valkey(cache) => cache.refresh(key).await,
         }
     }
 
@@ -388,6 +448,25 @@ impl ValkeyCache {
         }
     }
 
+    /// Return the entry even when its TTL elapsed. Valkey enforces the TTL
+    /// server side and drops expired values, so this matches `get` without
+    /// touching the hit/miss counters.
+    pub async fn get_with_stale(&self, key: &str) -> Option<CachedResponse> {
+        match self.command(&["GET", key]).await {
+            Ok(Some(payload)) => decode_response(&payload),
+            _ => None,
+        }
+    }
+
+    /// Extend the TTL of an existing entry after a 304 revalidation.
+    pub async fn refresh(&self, key: &str) -> bool {
+        let ttl = self.ttl.as_secs().max(1).to_string();
+        matches!(
+            self.command(&["EXPIRE", key, &ttl]).await,
+            Ok(Some(reply)) if reply == "1"
+        )
+    }
+
     pub async fn clear(&self) {
         if let Ok(Some(keys)) = self.command(&["KEYS", "searxng:*"]).await {
             for key in keys.split('\n') {
@@ -417,6 +496,11 @@ fn encode_response(response: &CachedResponse) -> Option<String> {
         "final_url": response.final_url,
         "headers": response.headers,
         "body": base64::engine::general_purpose::STANDARD.encode(response.body.as_slice()),
+        // Optional validators. Older payloads omit both keys and older
+        // decoders ignore them, so the format stays compatible in both
+        // directions.
+        "etag": response.etag,
+        "last_modified": response.last_modified,
     });
     serde_json::to_string(&document).ok()
 }
@@ -450,6 +534,14 @@ fn decode_response(payload: &str) -> Option<CachedResponse> {
             .to_string(),
         headers,
         body: std::sync::Arc::new(body),
+        etag: document
+            .get("etag")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        last_modified: document
+            .get("last_modified")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -676,6 +768,13 @@ mod valkey_tests {
                 let mut stream = tokio::io::BufReader::new(stream);
                 assert_eq!(read_command(&mut stream).await[0], "GET");
                 if stall_write {
+                    // GET (fast path), GET (under the request lock) and GET
+                    // (stale lookup) all miss before the origin response is
+                    // written back with SET.
+                    for _ in 0..2 {
+                        stream.get_mut().write_all(b"$-1\r\n").await.unwrap();
+                        assert_eq!(read_command(&mut stream).await[0], "GET");
+                    }
                     stream.get_mut().write_all(b"$-1\r\n").await.unwrap();
                     assert_eq!(read_command(&mut stream).await[0], "SET");
                 }
@@ -717,6 +816,8 @@ mod valkey_tests {
                 .into_iter()
                 .collect(),
             body: std::sync::Arc::new(b"hello".to_vec()),
+            etag: Some("\"v1\"".into()),
+            last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
         };
         let payload = encode_response(&response).expect("encode");
         let decoded = decode_response(&payload).expect("decode");
@@ -727,5 +828,66 @@ mod valkey_tests {
             decoded.headers.get("content-type").map(String::as_str),
             Some("text/html")
         );
+        assert_eq!(decoded.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(
+            decoded.last_modified.as_deref(),
+            Some("Thu, 01 Jan 2026 00:00:00 GMT")
+        );
+    }
+
+    #[test]
+    fn payloads_without_validators_decode_for_compatibility() {
+        // A payload written before the validators were stored.
+        let payload =
+            r#"{"status":200,"final_url":"https://example.test/","body":"aGVsbG8="}"#;
+        let decoded = decode_response(payload).expect("decode");
+        assert_eq!(decoded.body.as_slice(), b"hello");
+        assert!(decoded.etag.is_none());
+        assert!(decoded.last_modified.is_none());
+    }
+
+    #[tokio::test]
+    async fn valkey_get_with_stale_returns_the_entry_without_counting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            assert_eq!(read_command(&mut stream).await, ["GET", "key"]);
+            let payload = r#"{"status":200,"final_url":"https://example.test/","body":"aGVsbG8=","etag":"\"v1\""}"#;
+            stream
+                .get_mut()
+                .write_all(format!("${}\r\n{payload}\r\n", payload.len()).as_bytes())
+                .await
+                .unwrap();
+        });
+        let cache = Cache::valkey(&url, Duration::from_secs(60));
+        let stale = cache.get_with_stale("key").await.expect("entry");
+        assert_eq!(stale.body.as_slice(), b"hello");
+        assert_eq!(stale.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(cache.stats().hit, 0);
+        assert_eq!(cache.stats().miss, 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_extends_the_valkey_ttl() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            assert_eq!(read_command(&mut stream).await, ["EXPIRE", "key", "60"]);
+            stream.get_mut().write_all(b":1\r\n").await.unwrap();
+            assert_eq!(
+                read_command(&mut stream).await,
+                ["EXPIRE", "missing", "60"]
+            );
+            stream.get_mut().write_all(b":0\r\n").await.unwrap();
+        });
+        let cache = Cache::valkey(&url, Duration::from_secs(60));
+        assert!(cache.refresh("key").await);
+        assert!(!cache.refresh("missing").await);
+        server.await.unwrap();
     }
 }
