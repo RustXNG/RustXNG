@@ -168,3 +168,166 @@ fn sigterm_stops_the_server_gracefully() {
         }
     }
 }
+
+/// A fake Mwmbl engine that answers only after `delay`.
+#[cfg(unix)]
+fn spawn_delayed_engine(delay: std::time::Duration) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fake engine");
+    let address = listener.local_addr().expect("local address");
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            std::thread::sleep(delay);
+            let body = r#"[{"url":"https://example.com/slow","title":[{"value":"Slow result"}],"extract":[{"value":"Answered after the delay."}]}]"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        }
+    });
+    (format!("http://{address}/api/v1"), handle)
+}
+
+#[cfg(unix)]
+fn shutdown_settings(path: &std::path::Path, engine_url: &str, port: u16, grace: u64) {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path).expect("create settings");
+    write!(
+        file,
+        "use_default_settings = false\n[server]\nbind_address = \"127.0.0.1\"\nport = {port}\nsecret_key = \"cli-test-secret\"\nshutdown_grace = {grace}\n[search]\nlocal_index_path = \"\"\ntimeout_limit = 20.0\n[[engines]]\nname = \"mwmbl\"\nengine = \"mwmbl\"\nshortcut = \"mwm\"\nbase_url = \"{engine_url}\"\n"
+    )
+    .expect("write settings");
+}
+
+#[cfg(unix)]
+fn wait_for_healthz(port: u16) {
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the server did not listen on port {port}");
+}
+
+#[cfg(unix)]
+fn start_search(port: u16) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => stream,
+            Err(error) => return format!("connect failed: {error}"),
+        };
+        let _ = stream.write_all(
+            b"GET /search?q=slow&format=json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        answer
+    })
+}
+
+#[cfg(unix)]
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> std::process::ExitStatus {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait().expect("wait for the server") {
+            Some(status) => return status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!("the server did not exit within {limit:?}");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_drains_an_in_flight_request() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pick a port");
+        listener.local_addr().expect("local addr").port()
+    };
+    let settings = dir.path().join("settings.toml");
+    let (engine_url, engine) = spawn_delayed_engine(Duration::from_millis(800));
+    shutdown_settings(&settings, &engine_url, port, 8);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustxng"))
+        .args(["--config", settings.to_str().expect("utf-8 path")])
+        .env("RUST_LOG", "error")
+        .spawn()
+        .expect("start the server");
+    wait_for_healthz(port);
+
+    let search = start_search(port);
+    std::thread::sleep(Duration::from_millis(200));
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success());
+
+    let answer = search.join().expect("search thread");
+    assert!(
+        answer.starts_with("HTTP/1.1 200"),
+        "the in-flight request must finish: {answer:.200}"
+    );
+    let exit = wait_for_exit(&mut child, Duration::from_secs(6));
+    assert_eq!(exit.code(), Some(0));
+    engine.join().expect("engine thread");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_after_the_shutdown_grace() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pick a port");
+        listener.local_addr().expect("local addr").port()
+    };
+    let settings = dir.path().join("settings.toml");
+    let (engine_url, engine) = spawn_delayed_engine(Duration::from_secs(10));
+    shutdown_settings(&settings, &engine_url, port, 1);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustxng"))
+        .args(["--config", settings.to_str().expect("utf-8 path")])
+        .env("RUST_LOG", "error")
+        .spawn()
+        .expect("start the server");
+    wait_for_healthz(port);
+
+    let _search = start_search(port);
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success());
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(6));
+    let elapsed = started.elapsed();
+    assert_eq!(exit.code(), Some(0));
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the watchdog must end the drain before the 10s engine answer: {elapsed:?}"
+    );
+    // The client connection is closed by the stopped server; the engine thread
+    // finishes its sleep on its own and is not part of the server process.
+    engine.join().expect("engine thread");
+}

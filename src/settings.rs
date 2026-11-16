@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::locales;
 
+/// Default seconds the server drains in-flight requests after a stop signal.
+fn default_shutdown_grace() -> u64 {
+    10
+}
+
 /// Largest page number the HTTP API accepts.
 ///
 /// `search.max_page = 0` means "no configured limit", but every engine
@@ -198,6 +203,12 @@ pub struct Server {
     /// Handy for sidecars that a launcher forgets to stop.
     #[serde(default)]
     pub idle_timeout: u64,
+    /// Seconds the server keeps draining after SIGTERM/SIGINT before it stops.
+    ///
+    /// Containers and service managers kill a process that outlives their own
+    /// grace period, so the drain has to end on its own.
+    #[serde(default = "default_shutdown_grace")]
+    pub shutdown_grace: u64,
     pub base_url: Option<String>,
     pub secret_key: String,
     /// `server.limiter`: the legacy boolean or a `[server.limiter]` table.
@@ -223,6 +234,7 @@ impl Default for Server {
             bind_address: "127.0.0.1".into(),
             port: 29483,
             idle_timeout: 0,
+            shutdown_grace: default_shutdown_grace(),
             base_url: None,
             secret_key: String::new(),
             limiter: LimiterSettings::default(),
@@ -243,6 +255,11 @@ impl Server {
     }
 
     /// The `[server.limiter]` table, if the table form is used.
+    /// Seconds spent draining in-flight requests on shutdown (default 10).
+    pub fn shutdown_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.shutdown_grace)
+    }
+
     pub fn limiter_config(&self) -> Option<&LimiterConfig> {
         self.limiter.config()
     }

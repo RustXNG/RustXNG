@@ -231,6 +231,7 @@ async fn main() -> ExitCode {
         version_string()
     );
 
+    let shutdown_grace = settings_shutdown_grace(&searcher);
     let state = AppState::new(searcher);
     // Track the last request so an idle sidecar can exit on its own.
     let idle_seconds = idle_timeout_seconds(&state);
@@ -257,15 +258,51 @@ async fn main() -> ExitCode {
     };
     tracing::info!("listening on http://{address}");
 
-    if let Err(error) = axum::serve(
+    // Stop is decided once and shared: the server drains, and a watchdog ends
+    // the drain when shutdown_grace elapses so a container or service manager
+    // never has to kill the process. Dropping the runtime afterwards stops the
+    // remaining tasks and any renderer/PDF child (both spawn kill_on_drop).
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_reason(activity, idle_seconds).await;
+        let _ = stop_tx.send(true);
+    });
+    let mut drain_rx = stop_rx.clone();
+    let graceful = async move {
+        while drain_rx.changed().await.is_ok() {
+            if *drain_rx.borrow() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    };
+    let mut watchdog_rx = stop_rx.clone();
+    let watchdog = async move {
+        while watchdog_rx.changed().await.is_ok() {
+            if *watchdog_rx.borrow() {
+                break;
+            }
+        }
+        tokio::time::sleep(shutdown_grace).await;
+    };
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_reason(activity, idle_seconds))
-    .await
-    {
-        eprintln!("error: server failed: {error}");
-        return ExitCode::FAILURE;
+    .with_graceful_shutdown(graceful);
+    tokio::select! {
+        result = serve => {
+            if let Err(error) = result {
+                eprintln!("error: server failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        () = watchdog => {
+            tracing::warn!(
+                grace = ?shutdown_grace,
+                "shutdown grace elapsed; stopping with requests still running"
+            );
+        }
     }
     ExitCode::SUCCESS
 }
@@ -294,6 +331,10 @@ fn apply_listener(
     format!("{bind}:{port}")
         .parse()
         .map_err(|error| format!("invalid listen address {bind}:{port}: {error}"))
+}
+
+fn settings_shutdown_grace(searcher: &Searcher) -> std::time::Duration {
+    searcher.settings.server.shutdown_grace()
 }
 
 /// Seconds since the epoch.
