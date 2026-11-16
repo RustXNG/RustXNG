@@ -42,3 +42,27 @@ Docker 無しでも同じ確認ができる（/tmp に「上書きだけ」の s
 
 実行していない検証: 実エンジン応答、実 Valkey、実 MySQL/MariaDB、実ブラウザー（Firefox レンダラー）、
 実 LLM 課金、DNS rebinding の実接続再現、Windows/macOS 実機。
+## ignored テスト 4 件の実行条件（2026-11-17 時点）
+
+| テスト | 条件 | CI |
+| --- | --- | --- |
+| `tests/mysql.rs` の 1 件 | `--features db-engines` かつ `MYSQL_TEST_PORT` が指す MySQL/MariaDB が起動していること | `mysql-integration` ジョブ（MariaDB サービス）で `--ignored` 実行 |
+| `tests/rendered_pages.rs` の 2 件 | Node.js と `tools/page-renderer`、Firefox が必要 | `javascript-pages` ジョブが `npx playwright install firefox` 後に `--include-ignored` で実行 |
+| `src/mcp/benchmark.rs` の 1 件 | 保持済み eval 応答と `RUSTXNG_BUDGET_INPUT/OUTPUT` の指定が必要 | どの workflow でも実行しない（手動） |
+
+ローカルで `--include-ignored` を実行した結果、rendered_pages の 2 件は Firefox 不在で失敗（条件どおり）。
+Linux 以外の OS は CI の matrix に委譲し、この環境では検証していない（NOT_TESTED）。
+
+## baseline との比較
+
+| 項目 | f7639ce (v0.31.2) | 936b1e5（中間） | 2722523（最終候補） |
+| --- | ---: | ---: | ---: |
+| Rust テスト passed | 1177 | 1187 | 1175 |
+| うち ignored | 4 | 4 | 4 |
+| Python テスト | 85 | 86 | 86 |
+| src 行数 | 86,859 | 83,202 | 83,202 + results/rank.rs 移動 |
+| release バイナリ | 35,814,192 B | 35,813,744 B | 35.8 MB 前後 |
+| 起動 → /healthz | 0.05–0.25 s | 0.186 s | 0.19–0.25 s |
+| アイドル RSS | 23.8 MiB | 24.5 MiB | 24.5–24.7 MiB |
+
+テスト件数は目的ではなく、機能削除（デッドコード）と統合で純増しない。
