@@ -73,7 +73,12 @@ impl EngineStates {
     }
 
     fn with_state<T>(&self, engine: &str, action: impl FnOnce(&mut EngineState) -> T) -> T {
-        let mut states = self.states.lock().expect("engine states are not poisoned");
+        // A panic elsewhere must not turn every later search into a panic:
+        // recover the guard like the response cache does.
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = states.entry(engine.to_string()).or_default();
         action(state)
     }
@@ -171,14 +176,17 @@ impl EngineStates {
     pub fn reset(&self) {
         self.states
             .lock()
-            .expect("engine states are not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
     }
 
     /// Snapshot of every engine that has been used.
     pub fn snapshot(&self) -> Vec<EngineSnapshot> {
         let now = Instant::now();
-        let states = self.states.lock().expect("engine states are not poisoned");
+        let states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut snapshots: Vec<EngineSnapshot> = states
             .iter()
             .map(|(engine, state)| {

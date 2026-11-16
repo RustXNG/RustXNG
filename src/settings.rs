@@ -1091,6 +1091,7 @@ impl Settings {
             }
         }
         self.validate_cache()?;
+        self.validate_suspension()?;
         self.validate_research()?;
         self.validate_base_url()?;
         let mut names: BTreeMap<&str, &str> = BTreeMap::new();
@@ -1121,6 +1122,25 @@ impl Settings {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Suspension windows become `Instant + Duration`; a value large enough to
+    /// overflow panics while the engine-state lock is held.
+    fn validate_suspension(&self) -> Result<(), SettingsError> {
+        const MAX_SUSPENSION_SECONDS: u64 = 365 * 24 * 60 * 60;
+        for (reason, seconds) in &self.search.suspended_times {
+            if *seconds > MAX_SUSPENSION_SECONDS {
+                return Err(SettingsError::Validation(format!(
+                    "search.suspended_times.{reason} must be at most {MAX_SUSPENSION_SECONDS} seconds"
+                )));
+            }
+        }
+        if self.search.empty_result_cooldown > MAX_SUSPENSION_SECONDS {
+            return Err(SettingsError::Validation(format!(
+                "search.empty_result_cooldown must be at most {MAX_SUSPENSION_SECONDS} seconds"
+            )));
         }
         Ok(())
     }
@@ -1224,9 +1244,7 @@ impl Settings {
             );
         }
         if !self.general.enable_metrics {
-            warnings.push(
-                "general.enable_metrics = false: /metrics answers 404".to_string(),
-            );
+            warnings.push("general.enable_metrics = false: /metrics answers 404".to_string());
         }
         if self.research.enabled && self.research.api_key.trim().is_empty() {
             warnings.push(
@@ -1987,6 +2005,28 @@ engines:
     }
 
     #[test]
+    fn suspension_windows_stay_within_a_year() {
+        let mut settings = Settings::defaults();
+        settings
+            .search
+            .suspended_times
+            .insert("SearxEngineAccessDenied".into(), 365 * 24 * 60 * 60);
+        settings.validate().expect("a year is allowed");
+        settings
+            .search
+            .suspended_times
+            .insert("SearxEngineAccessDenied".into(), 365 * 24 * 60 * 60 + 1);
+        assert!(
+            settings.validate().is_err(),
+            "a window larger than a year is rejected"
+        );
+
+        let mut settings = Settings::defaults();
+        settings.search.empty_result_cooldown = 366 * 24 * 60 * 60;
+        assert!(settings.validate().is_err(), "the cooldown is bounded too");
+    }
+
+    #[test]
     fn warnings_explain_valid_but_surprising_settings() {
         let mut settings = Settings::defaults();
         settings.search.max_page = 20;
@@ -1998,21 +2038,30 @@ engines:
 
         settings.search.max_page = 0;
         assert!(
-            settings.warnings().iter().any(|warning| warning.contains("max_page")),
+            settings
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("max_page")),
             "the page cap is explained"
         );
 
         settings.search.max_page = 20;
         settings.server.bind_address = "0.0.0.0".into();
         assert!(
-            settings.warnings().iter().any(|warning| warning.contains("limiter")),
+            settings
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("limiter")),
             "a public bind without the limiter is called out"
         );
 
         settings.server.bind_address = "127.0.0.1".into();
         settings.research.enabled = true;
         assert!(
-            settings.warnings().iter().any(|warning| warning.contains("api_key")),
+            settings
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("api_key")),
             "research without a key is called out"
         );
     }
@@ -2042,7 +2091,9 @@ engines:
         settings.server.base_url = Some("https://search.example/".into());
         settings.validate().expect("absolute https URL");
         settings.server.base_url = Some(String::new());
-        settings.validate().expect("an empty value falls back to the listener");
+        settings
+            .validate()
+            .expect("an empty value falls back to the listener");
     }
 
     #[test]
