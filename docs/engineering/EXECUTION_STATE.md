@@ -89,6 +89,9 @@
 57. Phase 5.5: `server.shutdown_grace`（既定 10 秒）と drain watchdog（`71388da`）。SIGTERM の drain 内完了・期限超過の 2 テスト
 58. Phase 5.3: 既定 / 最小 / 全 feature の比較（`docs/LIGHTWEIGHT.md`）。依存 349 vs 286、バイナリ −23.8%、起動・RSS は同等。既定は変更しない判断
 
+59. Phase 4.3: `results/rank.rs` 分離をサブエージェント実装から取り込み（`664f5bf`, `7fb910e`）— mod.rs 1,497 行 / rank.rs 832 行、ランキング単体テスト 9 件、公開 API は re-export で維持
+60. Phase 2/3: engine 例外の範囲を限定（`a89ded3`）— 有効 engine の base_url + search_url ホストのみ、proxy 時 cross-origin リダイレクト拒否、別 engine ホストへのリダイレクト拒否。単体テスト 2 件
+
 ## 未完了・追跡
 
 - R3: エンジン側 pageno 演算は checked でない（入口上限で緩和）

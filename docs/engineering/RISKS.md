@@ -13,7 +13,7 @@
 | R7 | P3 | 検索品質（Hit@5 64–69）は旧構成（84）より低い。プロバイダー除外の帰結で、コードでは解決しない | docs/PERFORMANCE-2026-11-05.md, docs/ISSUE-RESOLUTION-2026-11-06.md | 許諾済み広域検索 API の確保、または索引拡充（外部判断） |
 | R9 | ~~P1~~ 解消 | デッドコード（i18n / wikidata infobox）| 2026-11-17 に削除（コミット cc34686）。判断: 参照・include・build.rs・テンプレート・公開 API を確認し、外部利用は無し |
 | R10 | ~~P2~~ 解消 | shutdown drain の期限 | `server.shutdown_grace`（既定 10 秒）を追加（コミット 71388da）、2 テストで検証 |
-| R11 | P2 | engine クライアントの DNS 例外は `base_url` ホストのみで、`search_url` だけを持つ自己ホスト engine は例外にならない | `configured_engine_hosts` が base_url のみ参照（search_url 使用 engine は 18 ファイル） | 例外に search_url のホストも含めるか、仕様として明記 |
+| R11 | ~~P2~~ 解消 | engine 例外の適用範囲 | 2026-11-17 修正（a89ded3）。有効 engine の base_url + search_url ホストのみ、proxy 時は cross-origin 拒否、別 engine ホストへのリダイレクト拒否。リダイレクト先/結果 URL/画像/MCP には非適用 |
 | R12 | P2 | 多ソース融合評価の fixture が商用 API ダンプ（gitignore）依存で、クリーンクローンでは n=13 しか再現できない | `.gitignore` に対象 JSON、`bench/local-retrieval/fusion-lab/README.md` に注記 | URL+順位のみの派生 fixture を追跡下に作る（n≥100） |
 | R13 | P3 | 既存の融合層は「単一プロバイダ単独」に有意に勝てない（ablation: position-only 0.768 < solo:exa 0.835、p=0.0015） | fusion-lab の実測（ローカル限定 fixture） | 主張を「融合層」と「後段の lexical/authority」に分けて記録 |
 | R8 | P3 | プロバイダー条件の確認は「記録」であり法的適合の保証ではない | docs/PROVIDERS.md, docs/provider-policy.json | 利用者向けの注意書きを維持 |

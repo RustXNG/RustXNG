@@ -63,6 +63,15 @@ ADR 形式。各決定に「理由」「代替案」「影響」を付ける。�
 - 理由: 上流は `format != html` のときだけ API_WINDOW を加算する。ページ表示の favicon で API 枠を食うのは上流不一致。
 - 影響: API 予算が検索 API 専用になる。burst/long は全リクエスト共通のまま。
 
+## D21: engine 例外は「有効な engine の base_url と search_url のホスト」に限る
+
+- 決定: DNS 検証の例外に含めるのは、有効な engine の `base_url` と `search_url` の**ホスト名のみ**。
+  - リダイレクト先・検索結果 URL・画像 URL・MCP read_page には適用しない。
+  - proxy 使用時は cross-origin リダイレクトを一切追わない（proxy が名前解決するためローカルで検証できない）。
+  - 別の設定済み engine ホストへの cross-origin リダイレクトは拒否する（目的地として信頼しても、経由地にはしない）。
+- 理由: 自己ホスト型 engine を search_url だけで設定する運用があり、無条件の除外は危険。境界を最小化した。
+- 実測: engine-ssrf サブエージェントがローカル 3 サーバーと自前 proxy で接続先を確認（private ヒット 0、proxy 経由の nip.io は修正前 1）。
+
 ## D20: engine クライアントも宛先検証する（設定ホストだけ例外）
 
 - 決定: engine 用 client に検証リゾルバとリダイレクト検証を入れ、本文を 8 MiB で打ち切る。例外は `base_url` のホストのみ。
