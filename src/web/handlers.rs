@@ -149,6 +149,15 @@ async fn run_search(
         .clone()
         .filter(|format| !format.is_empty())
         .unwrap_or_else(|| "html".to_string());
+    // Check the limiter before validating the rest of the query: a rejected
+    // request still costs a response, so an invalid one must not be free.
+    if let Some(response) = limiter_response(
+        &state,
+        &format,
+        state.limiter.check(peer.0, &headers, &format),
+    ) {
+        return response;
+    }
     if !settings.search.formats.contains(&format) {
         return format_error(
             &state,
@@ -274,14 +283,7 @@ async fn run_search(
         .unwrap_or_else(|| preferences.disabled_plugins.clone());
     let language = query.engine_language();
 
-    let user = user_info(&headers);
-    if let Some(response) = limiter_response(
-        &state,
-        &format,
-        state.limiter.check(peer.0, &headers, &format),
-    ) {
-        return response;
-    }
+    let user = user_info(&state, &peer, &headers);
 
     let request = SearchRequest {
         query: query.clone(),
@@ -509,7 +511,7 @@ pub async fn autocompleter(
     if let Some(response) = limiter_response(
         &state,
         "json",
-        state.limiter.check(peer.0, &headers, "json"),
+        state.limiter.check(peer.0, &headers, "html"),
     ) {
         return response;
     }
@@ -974,6 +976,7 @@ fn prometheus_metrics(state: &AppState) -> String {
     let readiness = crate::diagnostics::Readiness::evaluate(
         state.settings(),
         state.searcher.registry.len(),
+        Some(state.searcher.local_index.is_some() || state.searcher.wiki_index.is_some()),
     );
     gauge(
         "searxng_ready",
@@ -986,13 +989,19 @@ fn prometheus_metrics(state: &AppState) -> String {
         "Engines built from the configuration",
         &mut out,
     );
-    out.push_str(&format!("searxng_engines_configured {}\n", readiness.engines));
+    out.push_str(&format!(
+        "searxng_engines_configured {}\n",
+        readiness.engines
+    ));
     gauge(
         "searxng_local_index",
         "1 when a configured local index exists on disk",
         &mut out,
     );
-    out.push_str(&format!("searxng_local_index {}\n", u8::from(readiness.local_index)));
+    out.push_str(&format!(
+        "searxng_local_index {}\n",
+        u8::from(readiness.local_index)
+    ));
 
     let limiter = state.limiter.stats();
     out.push_str("# HELP searxng_limiter_requests_total Requests seen by the limiter, by verdict\n# TYPE searxng_limiter_requests_total counter\n");
@@ -1022,7 +1031,9 @@ fn prometheus_metrics(state: &AppState) -> String {
         ("4xx", metrics.response_4xx),
         ("5xx", metrics.response_5xx),
     ] {
-        out.push_str(&format!("searxng_http_responses_total{{status=\"{class}\"}} {value}\n"));
+        out.push_str(&format!(
+            "searxng_http_responses_total{{status=\"{class}\"}} {value}\n"
+        ));
     }
 
     out.push_str("# HELP searxng_engines_request_count_total Requests sent to an engine\n# TYPE searxng_engines_request_count_total counter\n");
@@ -1163,6 +1174,7 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
     let readiness = crate::diagnostics::Readiness::evaluate(
         state.settings(),
         state.searcher.registry.len(),
+        Some(state.searcher.local_index.is_some() || state.searcher.wiki_index.is_some()),
     );
     let status = if readiness.ready {
         StatusCode::OK
@@ -1222,7 +1234,10 @@ pub async fn logo() -> Response {
 
 /// `GET /static/logo-wordmark.png` — the wordmark for light backgrounds.
 pub async fn wordmark() -> Response {
-    static_file(include_bytes!("../../static/logo-wordmark.png"), "image/png")
+    static_file(
+        include_bytes!("../../static/logo-wordmark.png"),
+        "image/png",
+    )
 }
 
 /// `GET /static/logo-wordmark-light.png` — the wordmark for dark backgrounds.
@@ -1316,20 +1331,10 @@ fn preferences_of(headers: &HeaderMap, state: &AppState) -> Preferences {
     )
 }
 
-fn user_info(headers: &HeaderMap) -> UserInfo {
-    let ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(',')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
+fn user_info(state: &AppState, peer: &ClientAddr, headers: &HeaderMap) -> UserInfo {
+    // Forwarded headers are only honoured from configured proxies, exactly
+    // as the rate limiter decides; a plugin must not show a spoofed address.
+    let ip = state.limiter.real_ip(peer.0, headers).to_string();
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())

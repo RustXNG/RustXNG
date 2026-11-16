@@ -604,7 +604,9 @@ async fn static_pages_and_metadata_are_served() {
         let (status, body, headers) = get_uri(&app, path).await;
         assert_eq!(status, StatusCode::OK, "{path}");
         assert_eq!(
-            headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some(content_type),
             "{path}"
         );
@@ -616,13 +618,19 @@ async fn static_pages_and_metadata_are_served() {
                 .contains("max-age="),
             "{path} carries a cache hint"
         );
-        assert!(body.len() > 1000, "{path} is a real asset, not an empty body");
+        assert!(
+            body.len() > 1000,
+            "{path} is a real asset, not an empty body"
+        );
     }
 
     // Every HTML page links the icon.
     let (status, body, _) = get_uri(&app, "/").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains(r#"<link rel="icon" href="/favicon.ico""#), "{body}");
+    assert!(
+        body.contains(r#"<link rel="icon" href="/favicon.ico""#),
+        "{body}"
+    );
 
     let (status, body, _) = get_uri(&app, "/about").await;
     assert_eq!(status, StatusCode::OK);
@@ -1385,14 +1393,24 @@ async fn metrics_endpoint_reports_readiness_cache_and_limiter() {
         .find(|line| line.starts_with("searxng_cache_bytes "))
         .expect("cache bytes are exported");
     assert!(
-        cache_bytes.rsplit(' ').next().unwrap().parse::<u64>().is_ok(),
+        cache_bytes
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok(),
         "{cache_bytes}"
     );
     let allowed = body
         .lines()
         .find(|line| line.starts_with("searxng_limiter_requests_total{verdict=\"allowed\"}"))
         .expect("allowed requests are exported");
-    let allowed: u64 = allowed.rsplit(' ').next().unwrap().parse().expect("counter");
+    let allowed: u64 = allowed
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("counter");
     assert!(allowed >= 1, "every allowed request is counted: {allowed}");
     assert!(
         body.contains("searxng_limiter_requests_total{verdict=\"blocked\"} 0"),
@@ -1410,7 +1428,12 @@ async fn metrics_endpoint_reports_readiness_cache_and_limiter() {
         .lines()
         .find(|line| line.starts_with("searxng_search_duration_seconds_count "))
         .expect("the search count is exported");
-    let searches: u64 = duration_line.rsplit(' ').next().unwrap().parse().expect("counter");
+    let searches: u64 = duration_line
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("counter");
     assert!(searches >= 1, "one search ran: {searches}");
     let sum_line = body
         .lines()
@@ -1425,11 +1448,16 @@ async fn metrics_endpoint_reports_readiness_cache_and_limiter() {
         let line = body
             .lines()
             .find(|line| {
-                line.starts_with(&format!("searxng_http_responses_total{{status=\"{class}\"}}"))
+                line.starts_with(&format!(
+                    "searxng_http_responses_total{{status=\"{class}\"}}"
+                ))
             })
             .unwrap_or_else(|| panic!("status class {class} is exported:\n{body}"));
         let value: u64 = line.rsplit(' ').next().unwrap().parse().expect("counter");
-        assert!(value >= minimum, "{class} is {value}, expected at least {minimum}");
+        assert!(
+            value >= minimum,
+            "{class} is {value}, expected at least {minimum}"
+        );
     }
 
     // A profile without any source reports that it cannot search.
@@ -1460,9 +1488,8 @@ fn every_configured_engine_builds_requests_within_the_page_limit() {
         for pageno in [1u32, 2, 1000] {
             match handle.build_request(&query, pageno) {
                 Ok(request) => {
-                    let parsed = url::Url::parse(&request.url).unwrap_or_else(|error| {
-                        panic!("{} page {pageno}: {error}", handle.name())
-                    });
+                    let parsed = url::Url::parse(&request.url)
+                        .unwrap_or_else(|error| panic!("{} page {pageno}: {error}", handle.name()));
                     assert!(
                         matches!(parsed.scheme(), "http" | "https"),
                         "{} page {pageno} produced {}",
@@ -1471,9 +1498,7 @@ fn every_configured_engine_builds_requests_within_the_page_limit() {
                     );
                     built += 1;
                 }
-                Err(error) => {
-                    failures.push((handle.name().to_string(), pageno, error.to_string()))
-                }
+                Err(error) => failures.push((handle.name().to_string(), pageno, error.to_string())),
             }
         }
     }
@@ -1633,4 +1658,65 @@ async fn oversized_request_bodies_are_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(json["error"].is_string(), "{body}");
+}
+
+#[tokio::test]
+async fn invalid_requests_still_count_against_the_limiter() {
+    let base_url = start_fake_engine().await;
+    let mut settings = settings_for(&base_url);
+    settings.server.limiter = LimiterSettings::Enabled(true);
+    settings.server.limiter_max = 1;
+    settings.server.limiter_window = 60;
+    let app = app(settings);
+
+    // The first request is rejected for its format but still spends the slot.
+    let (status, _, _) = get_uri(&app, "/search?q=rust&format=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The next one is refused before validation runs, so a rejection is not a
+    // way to send unlimited invalid requests.
+    let (status, _, _) = get_uri(&app, "/search?q=rust&format=bogus").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn media_proxies_do_not_spend_the_api_window() {
+    let base_url = start_fake_engine().await;
+    let mut settings = settings_for(&base_url);
+    settings.server.image_proxy = true;
+    settings.server.limiter = LimiterSettings::Enabled(true);
+    settings.server.limiter_max = 1;
+    settings.server.limiter_window = 60;
+    let app = app(settings);
+
+    // One request is allowed. A media request must be charged to the page
+    // windows, not to the JSON API window: the second media request is
+    // blocked by BURST_WINDOW, and the API window is still free for a search.
+    let unsigned = "/image_proxy?url=https%3A%2F%2Fexample.com%2Fa.png";
+    let (status, _, _) = get_uri(&app, unsigned).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body, _) = get_uri(&app, unsigned).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        !body.contains("API_WINDOW"),
+        "media requests are not API traffic: {body}"
+    );
+}
+
+#[tokio::test]
+async fn readyz_is_not_ready_when_the_local_index_cannot_open() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("meta.json"), "not json").expect("write a corrupt index");
+    let mut settings = settings_for("http://127.0.0.1:1");
+    settings.engines = Vec::new();
+    settings.search.local_index_path = dir.path().to_string_lossy().into_owned();
+    let app = app(settings);
+
+    let (status, body, _) = get_uri(&app, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["ready"], false, "{body}");
+    assert_eq!(
+        json["local_index"], false,
+        "a directory that cannot be opened is not an index: {body}"
+    );
 }

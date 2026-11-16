@@ -22,17 +22,22 @@ pub struct Readiness {
 impl Readiness {
     /// Evaluate `settings` for a registry of `engines` engines.
     ///
-    /// Only local facts are inspected: a configured engine, or a Tantivy index
-    /// (`meta.json`) under one of the index paths. Upstream availability is not
+    /// Only local facts are inspected: a configured engine, or a local index.
+    /// `index_open` is what the searcher actually opened (`Searcher` keeps
+    /// `None` when the directory is corrupt); `None` falls back to the path
+    /// check for callers that have no searcher. Upstream availability is not
     /// checked here.
-    pub fn evaluate(settings: &Settings, engines: usize) -> Self {
-        let local_index = [
-            settings.search.local_index_path.trim(),
-            settings.search.wikipedia_index_path.trim(),
-        ]
-        .iter()
-        .filter(|path| !path.is_empty())
-        .any(|path| std::path::Path::new(path).join("meta.json").is_file());
+    pub fn evaluate(settings: &Settings, engines: usize, index_open: Option<bool>) -> Self {
+        let configured = || {
+            [
+                settings.search.local_index_path.trim(),
+                settings.search.wikipedia_index_path.trim(),
+            ]
+            .iter()
+            .filter(|path| !path.is_empty())
+            .any(|path| std::path::Path::new(path).join("meta.json").is_file())
+        };
+        let local_index = index_open.unwrap_or_else(configured);
         let ready = engines > 0 || local_index;
         let reasons = if ready {
             Vec::new()
@@ -61,10 +66,15 @@ mod tests {
         settings.search.local_index_path = String::new();
         settings.search.wikipedia_index_path = String::new();
         assert_eq!(
-            Readiness::evaluate(&settings, 1),
-            Readiness { ready: true, engines: 1, local_index: false, reasons: Vec::new() }
+            Readiness::evaluate(&settings, 1, None),
+            Readiness {
+                ready: true,
+                engines: 1,
+                local_index: false,
+                reasons: Vec::new()
+            }
         );
-        let empty = Readiness::evaluate(&settings, 0);
+        let empty = Readiness::evaluate(&settings, 0, None);
         assert!(!empty.ready);
         assert_eq!(empty.reasons.len(), 2);
     }

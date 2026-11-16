@@ -197,7 +197,12 @@ async fn main() -> ExitCode {
         tracing::warn!("{}", warning);
     }
     if args.check_config {
-        let readiness = rustxng::diagnostics::Readiness::evaluate(&searcher.settings, searcher.registry.len());
+        let index_open = searcher.local_index.is_some() || searcher.wiki_index.is_some();
+        let readiness = rustxng::diagnostics::Readiness::evaluate(
+            &searcher.settings,
+            searcher.registry.len(),
+            Some(index_open),
+        );
         let report = serde_json::json!({
             "profile": profile.name(),
             "ready": readiness.ready,

@@ -97,7 +97,7 @@ pub async fn handler(
     if let Some(response) = super::handlers::limiter_response(
         &state,
         "plain",
-        state.limiter.check(peer.0, &headers, "image"),
+        state.limiter.check(peer.0, &headers, "html"),
     ) {
         return response;
     }

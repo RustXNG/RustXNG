@@ -94,7 +94,9 @@ pub async fn handler(
     if let Some(response) = super::handlers::limiter_response(
         &state,
         "plain",
-        state.limiter.check(peer.0, &headers, "image"),
+        // The image proxy is not a JSON API: count it like an HTML page so
+        // it does not spend the API bucket (upstream counts non-html only).
+        state.limiter.check(peer.0, &headers, "html"),
     ) {
         return response;
     }
