@@ -42,6 +42,7 @@ pub mod metrics;
 pub mod network;
 pub mod official;
 pub mod plugins;
+pub mod probe;
 pub mod quality;
 pub mod query;
 pub mod results;

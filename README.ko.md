@@ -15,13 +15,13 @@ RustXNG는 [SearXNG](https://github.com/searxng/searxng)를 바탕으로 만든 
 
 ## 빠른 시작
 
-[Releases](https://github.com/sahenjp/RustXNG/releases)에서 운영체제에 맞는 바이너리를 받을 수 있습니다. 실행 전에 함께 배포된 SHA-256 체크섬을 확인하세요.
+[Releases](https://github.com/RustXNG/RustXNG/releases)에서 운영체제에 맞는 바이너리를 받을 수 있습니다. 실행 전에 함께 배포된 SHA-256 체크섬을 확인하세요.
 
 Cargo로 설치하려면 다음 명령을 실행합니다.
 
 <!-- x-release-please-start-version -->
 ```bash
-cargo install --git https://github.com/sahenjp/RustXNG.git --tag v0.32.0 --locked
+cargo install --git https://github.com/RustXNG/RustXNG.git --tag v0.32.0 --locked
 ```
 <!-- x-release-please-end -->
 
@@ -137,6 +137,6 @@ Exa나 Tavily와의 비교에는 구조적 차이도 있습니다. RustXNG는 �
 
 ## 기여와 라이선스
 
-버그 제보와 제안은 [Issues](https://github.com/sahenjp/RustXNG/issues), [Discussions](https://github.com/sahenjp/RustXNG/discussions)에서 받습니다. 풀 리퀘스트도 환영합니다. 자세한 내용은 [CONTRIBUTING.md](CONTRIBUTING.md), [GOVERNANCE.md](GOVERNANCE.md), [MAINTAINERS.md](MAINTAINERS.md)를 참고하세요.
+버그 제보와 제안은 [Issues](https://github.com/RustXNG/RustXNG/issues), [Discussions](https://github.com/RustXNG/RustXNG/discussions)에서 받습니다. 풀 리퀘스트도 환영합니다. 자세한 내용은 [CONTRIBUTING.md](CONTRIBUTING.md), [GOVERNANCE.md](GOVERNANCE.md), [MAINTAINERS.md](MAINTAINERS.md)를 참고하세요.
 
 RustXNG는 [AGPL-3.0-or-later](LICENSE) 라이선스로 제공됩니다. SearXNG와 외부 기여자에 대한 출처 표시는 [NOTICE](NOTICE)에 기록되어 있습니다. 코드 라이선스가 외부 검색 제공자의 데이터를 수집하거나 재배포할 권한까지 부여하는 것은 아닙니다.

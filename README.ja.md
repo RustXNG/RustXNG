@@ -15,11 +15,11 @@ Web全体を独自に索引化する検索エンジンではありません。�
 
 ## 使い始める
 
-[Releases](https://github.com/sahenjp/RustXNG/releases)からOSに合うバイナリを入手できます。実行前に、公開されているSHA-256チェックサムを確認してください。Cargoからも導入できます。
+[Releases](https://github.com/RustXNG/RustXNG/releases)からOSに合うバイナリを入手できます。実行前に、公開されているSHA-256チェックサムを確認してください。Cargoからも導入できます。
 
 <!-- x-release-please-start-version -->
 ```bash
-cargo install --git https://github.com/sahenjp/RustXNG.git --tag v0.32.0 --locked
+cargo install --git https://github.com/RustXNG/RustXNG.git --tag v0.32.0 --locked
 ```
 <!-- x-release-please-end -->
 
@@ -131,6 +131,6 @@ ExaやTavilyとの比較には構造的な差もあります。RustXNGは複数�
 
 ## 開発への参加とライセンス
 
-不具合の報告や提案は[Issues](https://github.com/sahenjp/RustXNG/issues)と[Discussions](https://github.com/sahenjp/RustXNG/discussions)へお願いします。PRも歓迎します。詳しくは[CONTRIBUTING.md](CONTRIBUTING.md)、[GOVERNANCE.md](GOVERNANCE.md)、[MAINTAINERS.md](MAINTAINERS.md)を見てください。
+不具合の報告や提案は[Issues](https://github.com/RustXNG/RustXNG/issues)と[Discussions](https://github.com/RustXNG/RustXNG/discussions)へお願いします。PRも歓迎します。詳しくは[CONTRIBUTING.md](CONTRIBUTING.md)、[GOVERNANCE.md](GOVERNANCE.md)、[MAINTAINERS.md](MAINTAINERS.md)を見てください。
 
 RustXNGのライセンスは[AGPL-3.0-or-later](LICENSE)です。SearXNGと外部の貢献者への帰属表示は[NOTICE](NOTICE)に記載しています。コードのライセンスは、外部検索サービスのデータ取得や再配布を無条件に許可するものではありません。

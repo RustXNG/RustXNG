@@ -1,5 +1,6 @@
 //! Binary entry point: `rustxng [--profile NAME] [--config FILE] [--bind ADDRESS] [--port PORT]`.
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -14,6 +15,7 @@ const HELP: &str = "rustxng - a Rust rewrite of the SearXNG metasearch engine
 
 USAGE:
     rustxng [OPTIONS]
+    rustxng --check-engines [--profile NAME] [--query TEXT] [--timeout SECS] [--json]
     rustxng mcp [--profile NAME] [--config FILE]
                                    Serve MCP tools on stdin/stdout
 
@@ -30,6 +32,12 @@ OPTIONS:
     -p, --port <PORT>      Port to listen on (default: server.port)
     --check-config        Validate the settings, build the engines and print
                           whether this instance can search (no socket is opened)
+    --check-engines       Ask every enabled engine once and print its health
+                          (diagnostic; the exit code stays 0 unless the profile
+                          cannot be built). The probe does not use the cache
+    --query <TEXT>        Query sent by --check-engines (default: rust)
+    --timeout <SECS>      Per-engine deadline for --check-engines (default: 5)
+    --json                Print the --check-engines report as JSON
     --check-update        Check the latest official release
     --update              Download, verify and install the latest release
     -v, --version          Print the version
@@ -43,22 +51,30 @@ ENVIRONMENT:
 struct Args {
     mcp: bool,
     check_config: bool,
+    check_engines: bool,
     config: Option<PathBuf>,
     profile: Option<Profile>,
     bind: Option<String>,
     port: Option<u16>,
     update: Option<bool>,
+    query: Option<String>,
+    timeout: Option<f64>,
+    json: bool,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
     let mut args = Args {
         mcp: false,
         check_config: false,
+        check_engines: false,
         config: None,
         profile: None,
         bind: None,
         port: None,
         update: None,
+        query: None,
+        timeout: None,
+        json: false,
     };
     let mut argv = std::env::args().skip(1).peekable();
     if argv.peek().map(String::as_str) == Some("mcp") {
@@ -72,6 +88,13 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "--check-config" => args.check_config = true,
+            "--check-engines" => args.check_engines = true,
+            "--json" => args.json = true,
+            "--query" => args.query = Some(argv.next().ok_or("--query needs text")?),
+            "--timeout" => {
+                let value = argv.next().ok_or("--timeout needs seconds")?;
+                args.timeout = Some(value.parse().map_err(|_| "--timeout needs seconds")?);
+            }
             "-v" | "--version" => {
                 println!("{}", version_string());
                 return Ok(None);
@@ -110,6 +133,16 @@ fn parse_args() -> Result<Option<Args>, String> {
                         .map_err(|_| "--port needs a number")?,
                 );
             }
+            other if other.starts_with("--query=") => {
+                args.query = Some(other["--query=".len()..].to_string());
+            }
+            other if other.starts_with("--timeout=") => {
+                args.timeout = Some(
+                    other["--timeout=".len()..]
+                        .parse()
+                        .map_err(|_| "--timeout needs seconds")?,
+                );
+            }
             other => return Err(format!("unknown argument {other:?} (try --help)")),
         }
     }
@@ -134,6 +167,26 @@ async fn main() -> ExitCode {
     if args.check_config && args.mcp {
         eprintln!("error: --check-config cannot be combined with mcp");
         return ExitCode::from(2);
+    }
+    if args.check_engines && (args.mcp || args.check_config || args.update.is_some()) {
+        eprintln!(
+            "error: --check-engines only accepts --profile, --config, --query, --timeout and --json"
+        );
+        return ExitCode::from(2);
+    }
+    if args.check_engines && (args.bind.is_some() || args.port.is_some()) {
+        eprintln!("error: --check-engines does not open a socket; drop --bind/--port");
+        return ExitCode::from(2);
+    }
+    if !args.check_engines && (args.query.is_some() || args.timeout.is_some() || args.json) {
+        eprintln!("error: --query, --timeout and --json need --check-engines");
+        return ExitCode::from(2);
+    }
+    if let Some(timeout) = args.timeout {
+        if !timeout.is_finite() || timeout <= 0.0 {
+            eprintln!("error: --timeout needs a positive number of seconds");
+            return ExitCode::from(2);
+        }
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -177,11 +230,17 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let address = match apply_listener(&mut settings, args.bind, args.port) {
-        Ok(address) => address,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::FAILURE;
+    // A probe never listens, so it must not fail on an unusable listener
+    // address: the health of the engines is what it reports.
+    let address = if args.check_engines {
+        None
+    } else {
+        match apply_listener(&mut settings, args.bind, args.port) {
+            Ok(address) => Some(address),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
         }
     };
 
@@ -195,6 +254,34 @@ async fn main() -> ExitCode {
     };
     for warning in &warnings {
         tracing::warn!("{}", warning);
+    }
+    if args.check_engines {
+        print_profile_notice(profile);
+        let options = rustxng::probe::ProbeOptions {
+            query: args
+                .query
+                .unwrap_or_else(|| rustxng::probe::DEFAULT_QUERY.to_string()),
+            timeout: std::time::Duration::from_secs_f64(
+                args.timeout
+                    .unwrap_or(rustxng::probe::DEFAULT_TIMEOUT.as_secs_f64()),
+            ),
+            concurrency: rustxng::probe::DEFAULT_CONCURRENCY,
+        };
+        let summary = rustxng::probe::run(&searcher, &options).await;
+        // A diagnostic must keep exit code 0 even when its reader goes away
+        // (for example `--check-engines | head`), so write errors are ignored.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if args.json {
+            let _ = writeln!(out, "{}", summary.to_json(profile.name()));
+        } else {
+            for report in &summary.engines {
+                if writeln!(out, "{}", report.line()).is_err() {
+                    break;
+                }
+            }
+        }
+        return ExitCode::SUCCESS;
     }
     if args.check_config {
         let index_open = searcher.local_index.is_some() || searcher.wiki_index.is_some();
@@ -249,6 +336,7 @@ async fn main() -> ExitCode {
             },
         ));
 
+    let address = address.expect("the listen address is resolved outside --check-engines");
     let listener = match tokio::net::TcpListener::bind(address).await {
         Ok(listener) => listener,
         Err(error) => {
