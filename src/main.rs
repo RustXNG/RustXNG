@@ -290,6 +290,9 @@ async fn main() -> ExitCode {
             searcher.registry.len(),
             Some(index_open),
         );
+        // No search has run yet, so only the circuit policy can be reported
+        // here. The live per-engine phases are on `/stats` and `/metrics`.
+        let circuit = &searcher.settings.search.circuit;
         let report = serde_json::json!({
             "profile": profile.name(),
             "ready": readiness.ready,
@@ -297,6 +300,14 @@ async fn main() -> ExitCode {
             "local_index": readiness.local_index,
             "reasons": readiness.reasons,
             "warnings": warnings,
+            "circuit": {
+                "enabled": circuit.enabled,
+                "window": circuit.window,
+                "failure_ratio": circuit.failure_ratio,
+                "minimum_samples": circuit.minimum_samples,
+                "open_seconds": circuit.open_seconds,
+                "max_open_seconds": circuit.max_open_seconds,
+            },
         });
         println!("{report}");
         return ExitCode::SUCCESS;

@@ -911,8 +911,31 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
 /// Render the metrics in the Prometheus exposition format. The engine metric
 /// names are the upstream ones (`searxng_engines_*`).
 fn prometheus_metrics(state: &AppState) -> String {
-    let metrics = state.searcher.metrics.snapshot();
-    let cache = state.searcher.cache.stats();
+    let readiness = crate::diagnostics::Readiness::evaluate(
+        state.settings(),
+        state.searcher.registry.len(),
+        Some(state.searcher.local_index.is_some() || state.searcher.wiki_index.is_some()),
+    );
+    render_prometheus(
+        &state.searcher.metrics.snapshot(),
+        &state.searcher.cache.stats(),
+        &readiness,
+        &state.limiter.stats(),
+        &state.searcher.engine_snapshots(),
+    )
+}
+
+/// Render the exposition from already-collected snapshots.
+///
+/// Keeping the formatting pure makes the byte-level compatibility of the
+/// existing series testable without a running server.
+fn render_prometheus(
+    metrics: &crate::metrics::MetricsSnapshot,
+    cache: &crate::cache::CacheStats,
+    readiness: &crate::diagnostics::Readiness,
+    limiter: &super::limiter::LimiterStats,
+    engines: &[crate::engine::state::EngineSnapshot],
+) -> String {
     let mut out = String::new();
     let counter = |name: &str, help: &str, out: &mut String| {
         out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
@@ -979,11 +1002,6 @@ fn prometheus_metrics(state: &AppState) -> String {
 
     // Readiness is the same evaluation `/readyz` and `--check-config` use, so
     // an alert and a health probe cannot disagree about what "ready" means.
-    let readiness = crate::diagnostics::Readiness::evaluate(
-        state.settings(),
-        state.searcher.registry.len(),
-        Some(state.searcher.local_index.is_some() || state.searcher.wiki_index.is_some()),
-    );
     gauge(
         "searxng_ready",
         "1 when a search source (engine or local index) is configured",
@@ -1009,7 +1027,6 @@ fn prometheus_metrics(state: &AppState) -> String {
         u8::from(readiness.local_index)
     ));
 
-    let limiter = state.limiter.stats();
     out.push_str("# HELP searxng_limiter_requests_total Requests seen by the limiter, by verdict\n# TYPE searxng_limiter_requests_total counter\n");
     out.push_str(&format!(
         "searxng_limiter_requests_total{{verdict=\"allowed\"}} {}\n",
@@ -1050,7 +1067,7 @@ fn prometheus_metrics(state: &AppState) -> String {
     out.push_str("# HELP searxng_engines_suspended Whether the engine is currently suspended\n# TYPE searxng_engines_suspended gauge\n");
     out.push_str("# HELP searxng_engines_resting Whether the engine is resting due to repeated empty results\n# TYPE searxng_engines_resting gauge\n");
     out.push_str("# HELP searxng_engines_resting_seconds Remaining rest time in seconds\n# TYPE searxng_engines_resting_seconds gauge\n");
-    for engine in state.searcher.engine_snapshots() {
+    for engine in engines {
         let label = engine.engine.replace('"', "");
         let reliability = if engine.stats.requests == 0 {
             0.0
@@ -1087,6 +1104,51 @@ fn prometheus_metrics(state: &AppState) -> String {
         out.push_str(&format!(
             "searxng_engines_resting_seconds{{engine=\"{label}\"}} {:.3}\n",
             engine.resting_for
+        ));
+    }
+
+    // Engine health: the circuit breaker and the suspension ladder. These
+    // are appended after the established series so the existing exposition
+    // keeps its exact bytes and order. The labels stay bounded by the
+    // configured engines, with at most three state series per engine.
+    out.push_str("# HELP searxng_engines_circuit_state Circuit breaker phase; 1 for the phase named by the state label\n# TYPE searxng_engines_circuit_state gauge\n");
+    out.push_str("# HELP searxng_engines_circuit_failure_ratio Failure share of the circuit rolling window\n# TYPE searxng_engines_circuit_failure_ratio gauge\n");
+    out.push_str("# HELP searxng_engines_circuit_samples Outcomes currently in the circuit rolling window\n# TYPE searxng_engines_circuit_samples gauge\n");
+    out.push_str("# HELP searxng_engines_circuit_open_seconds Seconds until the open circuit allows a trial\n# TYPE searxng_engines_circuit_open_seconds gauge\n");
+    out.push_str("# HELP searxng_engines_suspended_seconds Remaining suspension time in seconds\n# TYPE searxng_engines_suspended_seconds gauge\n");
+    out.push_str("# HELP searxng_engines_consecutive_failures Consecutive failures since the last success\n# TYPE searxng_engines_consecutive_failures gauge\n");
+    for engine in engines {
+        let label = engine.engine.replace('"', "");
+        for state in [
+            crate::engine::state::CircuitState::Closed,
+            crate::engine::state::CircuitState::HalfOpen,
+            crate::engine::state::CircuitState::Open,
+        ] {
+            out.push_str(&format!(
+                "searxng_engines_circuit_state{{engine=\"{label}\",state=\"{}\"}} {}\n",
+                state.as_str(),
+                u8::from(engine.circuit == state)
+            ));
+        }
+        out.push_str(&format!(
+            "searxng_engines_circuit_failure_ratio{{engine=\"{label}\"}} {:.6}\n",
+            engine.circuit_failure_ratio
+        ));
+        out.push_str(&format!(
+            "searxng_engines_circuit_samples{{engine=\"{label}\"}} {}\n",
+            engine.circuit_samples
+        ));
+        out.push_str(&format!(
+            "searxng_engines_circuit_open_seconds{{engine=\"{label}\"}} {:.3}\n",
+            engine.circuit_open_for
+        ));
+        out.push_str(&format!(
+            "searxng_engines_suspended_seconds{{engine=\"{label}\"}} {:.3}\n",
+            engine.suspended_for
+        ));
+        out.push_str(&format!(
+            "searxng_engines_consecutive_failures{{engine=\"{label}\"}} {}\n",
+            engine.consecutive_failures
         ));
     }
     out.push_str("# EOF\n");
@@ -1435,5 +1497,216 @@ mod tests {
         );
         assert_eq!(split_param(Some("")), None);
         assert_eq!(split_param(None), None);
+    }
+
+    /// Fixed inputs for the exposition tests: no wall clock and one engine
+    /// whose circuit is open, so every series has a value.
+    fn exposition_fixture() -> (
+        crate::metrics::MetricsSnapshot,
+        crate::cache::CacheStats,
+        crate::diagnostics::Readiness,
+        crate::web::limiter::LimiterStats,
+        Vec<crate::engine::state::EngineSnapshot>,
+    ) {
+        let metrics = crate::metrics::MetricsSnapshot {
+            uptime: 12.5,
+            searches: 7,
+            engine_requests: 21,
+            engine_errors: 2,
+            engine_timeouts: 1,
+            results: 40,
+            cache_hits: 3,
+            response_2xx: 5,
+            response_3xx: 0,
+            response_4xx: 1,
+            response_5xx: 0,
+            search_duration_micros: 2_500_000,
+            search_duration_count: 7,
+        };
+        let cache = crate::cache::CacheStats {
+            hit: 3,
+            miss: 4,
+            entries: 2,
+            bytes: 1024,
+            error: 1,
+        };
+        let readiness = crate::diagnostics::Readiness {
+            ready: true,
+            engines: 1,
+            local_index: false,
+            reasons: Vec::new(),
+        };
+        let limiter = crate::web::limiter::LimiterStats {
+            enabled: true,
+            allowed: 9,
+            challenged: 1,
+            blocked: 0,
+            tracked: 2,
+        };
+        let engines = vec![crate::engine::state::EngineSnapshot {
+            engine: "example".to_string(),
+            stats: crate::engine::state::EngineStats {
+                requests: 10,
+                results: 20,
+                errors: 2,
+                timeouts: 1,
+                http_errors: 1,
+                total_time: 1.5,
+            },
+            consecutive_failures: 2,
+            suspended: true,
+            suspended_for: 60.0,
+            suspension_reason: Some("timeout".to_string()),
+            resting: false,
+            resting_for: 0.0,
+            circuit: crate::engine::state::CircuitState::Open,
+            circuit_open_for: 17.25,
+            circuit_failure_ratio: 0.75,
+            circuit_samples: 8,
+        }];
+        (metrics, cache, readiness, limiter, engines)
+    }
+
+    /// Series added with the engine-health block. Stripping them leaves
+    /// exactly the exposition the endpoint produced before that block.
+    const ADDED_SERIES: [&str; 6] = [
+        "searxng_engines_circuit_state",
+        "searxng_engines_circuit_failure_ratio",
+        "searxng_engines_circuit_samples",
+        "searxng_engines_circuit_open_seconds",
+        "searxng_engines_suspended_seconds",
+        "searxng_engines_consecutive_failures",
+    ];
+
+    fn existing_series(exposition: &str) -> String {
+        let mut kept = String::new();
+        for line in exposition.lines() {
+            let name = line
+                .strip_prefix("# HELP ")
+                .or_else(|| line.strip_prefix("# TYPE "))
+                .and_then(|rest| rest.split(' ').next())
+                .or_else(|| line.split(['{', ' ']).next());
+            if !name.is_some_and(|name| ADDED_SERIES.contains(&name)) {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        kept
+    }
+
+    /// The exposition the endpoint produced before the engine-health block,
+    /// byte for byte. The test below strips the added series first, so a new
+    /// line is allowed but any change to an existing line is not.
+    const EXISTING_EXPOSITION: &str = r#"# HELP searxng_search_requests_total Number of searches served
+# TYPE searxng_search_requests_total counter
+searxng_search_requests_total 7
+# HELP searxng_search_results_total Number of results returned to clients
+# TYPE searxng_search_results_total counter
+searxng_search_results_total 40
+# HELP searxng_uptime_seconds Process uptime
+# TYPE searxng_uptime_seconds gauge
+searxng_uptime_seconds 12.500
+# HELP searxng_search_duration_seconds_sum Total time spent inside searches
+# TYPE searxng_search_duration_seconds_sum counter
+searxng_search_duration_seconds_sum 2.500000
+# HELP searxng_search_duration_seconds_count Searches that contributed to the sum
+# TYPE searxng_search_duration_seconds_count counter
+searxng_search_duration_seconds_count 7
+# HELP searxng_cache_hit_total Number of cache hits
+# TYPE searxng_cache_hit_total counter
+searxng_cache_hit_total 3
+# HELP searxng_cache_miss_total Number of cache misses
+# TYPE searxng_cache_miss_total counter
+searxng_cache_miss_total 4
+# HELP searxng_cache_entries Cached responses
+# TYPE searxng_cache_entries gauge
+searxng_cache_entries 2
+# HELP searxng_cache_error_total Cache backend errors (decode or transport)
+# TYPE searxng_cache_error_total counter
+searxng_cache_error_total 1
+# HELP searxng_cache_bytes Bytes held by the in-memory cache
+# TYPE searxng_cache_bytes gauge
+searxng_cache_bytes 1024
+# HELP searxng_ready 1 when a search source (engine or local index) is configured
+# TYPE searxng_ready gauge
+searxng_ready 1
+# HELP searxng_engines_configured Engines built from the configuration
+# TYPE searxng_engines_configured gauge
+searxng_engines_configured 1
+# HELP searxng_local_index 1 when a configured local index exists on disk
+# TYPE searxng_local_index gauge
+searxng_local_index 0
+# HELP searxng_limiter_requests_total Requests seen by the limiter, by verdict
+# TYPE searxng_limiter_requests_total counter
+searxng_limiter_requests_total{verdict="allowed"} 9
+searxng_limiter_requests_total{verdict="challenged"} 1
+searxng_limiter_requests_total{verdict="blocked"} 0
+# HELP searxng_limiter_tracked Clients currently tracked by the limiter
+# TYPE searxng_limiter_tracked gauge
+searxng_limiter_tracked 2
+# HELP searxng_http_responses_total HTTP responses by status class
+# TYPE searxng_http_responses_total counter
+searxng_http_responses_total{status="2xx"} 5
+searxng_http_responses_total{status="3xx"} 0
+searxng_http_responses_total{status="4xx"} 1
+searxng_http_responses_total{status="5xx"} 0
+# HELP searxng_engines_request_count_total Requests sent to an engine
+# TYPE searxng_engines_request_count_total counter
+# HELP searxng_engines_result_count_total Results returned by an engine
+# TYPE searxng_engines_result_count_total counter
+# HELP searxng_engines_error_count_total Errors reported by an engine
+# TYPE searxng_engines_error_count_total counter
+# HELP searxng_engines_response_time_total_seconds Time spent waiting for an engine
+# TYPE searxng_engines_response_time_total_seconds counter
+# HELP searxng_engines_reliability_total Share of successful requests
+# TYPE searxng_engines_reliability_total gauge
+# HELP searxng_engines_suspended Whether the engine is currently suspended
+# TYPE searxng_engines_suspended gauge
+# HELP searxng_engines_resting Whether the engine is resting due to repeated empty results
+# TYPE searxng_engines_resting gauge
+# HELP searxng_engines_resting_seconds Remaining rest time in seconds
+# TYPE searxng_engines_resting_seconds gauge
+searxng_engines_request_count_total{engine="example"} 10
+searxng_engines_result_count_total{engine="example"} 20
+searxng_engines_error_count_total{engine="example"} 2
+searxng_engines_response_time_total_seconds{engine="example"} 1.500000
+searxng_engines_reliability_total{engine="example"} 0.800000
+searxng_engines_suspended{engine="example"} 1
+searxng_engines_resting{engine="example"} 0
+searxng_engines_resting_seconds{engine="example"} 0.000
+# EOF
+"#;
+
+    #[test]
+    fn the_existing_exposition_is_byte_for_byte_unchanged() {
+        let (metrics, cache, readiness, limiter, engines) = exposition_fixture();
+        let rendered = render_prometheus(&metrics, &cache, &readiness, &limiter, &engines);
+        assert_eq!(existing_series(&rendered), EXISTING_EXPOSITION);
+    }
+
+    #[test]
+    fn engine_health_gauges_report_the_circuit_and_suspension() {
+        let (metrics, cache, readiness, limiter, engines) = exposition_fixture();
+        let rendered = render_prometheus(&metrics, &cache, &readiness, &limiter, &engines);
+        for (state, value) in [("closed", 0), ("half-open", 0), ("open", 1)] {
+            assert!(
+                rendered.contains(&format!(
+                    "searxng_engines_circuit_state{{engine=\"example\",state=\"{state}\"}} {value}\n"
+                )),
+                "the {state} phase is exported:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered
+                .contains("searxng_engines_circuit_failure_ratio{engine=\"example\"} 0.750000\n")
+        );
+        assert!(rendered.contains("searxng_engines_circuit_samples{engine=\"example\"} 8\n"));
+        assert!(
+            rendered.contains("searxng_engines_circuit_open_seconds{engine=\"example\"} 17.250\n")
+        );
+        assert!(
+            rendered.contains("searxng_engines_suspended_seconds{engine=\"example\"} 60.000\n")
+        );
+        assert!(rendered.contains("searxng_engines_consecutive_failures{engine=\"example\"} 2\n"));
     }
 }

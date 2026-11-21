@@ -71,4 +71,5 @@
 - [x] 起動前の警告診断（`Settings::warnings` → `--check-config` と起動ログ）
 - [x] 文書内の相対リンク検査（`tools/test_doc_links.py`）とリリース計画の更新
 - [x] 独立監査用の候補スナップショット（`final-audit/CANDIDATE-STATE.md`）
+- [x] エンジン健康状態の可視化（`/stats`・`/metrics`・`--check-config` のサーキット表示と [OBSERVABILITY.md](../OBSERVABILITY.md) の監視手順）
 - [ ] 外部クライアント実機確認（環境制約により NOT_TESTED）
