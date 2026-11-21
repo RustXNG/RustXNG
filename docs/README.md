@@ -29,7 +29,9 @@ RustXNG の文書は目的別に分かれています。初めての場合は RE
 ## API とエージェント
 
 - [openapi.yaml](openapi.yaml): JSON API の仕様（`tools/test_openapi.py` がコードとの不一致を検出）
+- [CONTENT-API.md](CONTENT-API.md): `/map`・`/extract`・`/mcp`（サイト列挙、構造化抽出、HTTP の MCP）
 - [AGENT-OUTPUT.md](AGENT-OUTPUT.md): MCP の出力契約とトークン予算
+- [BENCHMARK-MULTILINGUAL.md](BENCHMARK-MULTILINGUAL.md): 多言語の品質評価セットと実行手順
 
 ## 性能と評価
 
