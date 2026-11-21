@@ -525,6 +525,10 @@ pub async fn autocompleter(
     if query.trim().is_empty() {
         return axum::Json(Vec::<String>::new()).into_response();
     }
+    if let Some(response) = limiter_response(&state, state.limiter.check(peer.0, &headers, "json"))
+    {
+        return response;
+    }
     let preferences = preferences_of(&headers, &state);
     let parsed = SearchQuery::parse(
         &query,
