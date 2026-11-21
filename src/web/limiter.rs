@@ -8,6 +8,8 @@
 //! * the pass/block IP lists (`ip_lists.py`),
 //! * the sliding window IP limit with burst, long and API windows
 //!   (`ip_limit.py`),
+//! * the API formats (`json`, `csv`, `rss`) are judged by client IP and rate
+//!   only; the bot detection rules stay on `html` and other formats,
 //! * the link token challenge (`link_token.py`), implemented as a stateless
 //!   HMAC cookie instead of a Valkey ping key,
 //! * the public instance hardening of `limiter.initialize()`.
@@ -479,6 +481,15 @@ impl Limiter {
             }
         }
 
+        // API formats are machine clients: the per-IP rate limit above is the
+        // whole verdict.  A User-Agent such as `python-requests/2.x` is not
+        // evidence of a bot for an API caller, and a script cannot pass the
+        // link token challenge, so the bot detection rules below only apply to
+        // `html` (and any non-API format).
+        if is_api_format(format) {
+            return self.limited(&mut state, &network, now);
+        }
+
         if !self.rules.link_token {
             return self.limited(&mut state, &network, now);
         }
@@ -921,6 +932,15 @@ fn mask_ip(ip: IpAddr, prefix: u8) -> IpAddr {
     }
 }
 
+/// Output formats served to machine clients (`search.formats`).
+///
+/// They are judged by client IP and rate only: the `User-Agent` header must
+/// not decide the verdict, so an API caller does not have to disable the
+/// limiter to use a non-browser client.
+fn is_api_format(format: &str) -> bool {
+    matches!(format, "json" | "csv" | "rss")
+}
+
 fn is_link_local(ip: IpAddr) -> bool {
     match normalize_ip(ip) {
         IpAddr::V4(address) => {
@@ -1064,6 +1084,96 @@ mod tests {
                 .is_allowed()
         );
         assert_eq!(limiter.stats().blocked, 1);
+    }
+
+    const BOT_USER_AGENT: &str = "python-requests/2.31.0";
+
+    fn bot_headers() -> HeaderMap {
+        headers(&[("user-agent", BOT_USER_AGENT)])
+    }
+
+    #[test]
+    fn api_formats_ignore_the_bot_user_agent() {
+        let mut rules = rules();
+        // The HTML path would challenge the second suspicious request.
+        rules.link_token = true;
+        rules.burst_max = 10;
+        rules.long_max = 10;
+        let limiter = test_limiter(rules, &[]);
+        let peer = Some(ip("203.0.113.7"));
+        let headers = bot_headers();
+
+        // A script's User-Agent says nothing about the API call: while under
+        // the rate limit every API format is allowed, without a challenge.
+        for format in ["json", "csv", "rss"] {
+            assert_eq!(
+                limiter.check(peer, &headers, format),
+                LimiterVerdict::Allow,
+                "format {format}"
+            );
+        }
+        let stats = limiter.stats();
+        assert_eq!(stats.allowed, 3);
+        assert_eq!(stats.challenged, 0);
+        assert_eq!(stats.blocked, 0);
+        assert!(stats.tracked > 0, "the windows are tracked for /stats");
+    }
+
+    #[test]
+    fn html_keeps_the_botdetection_rules_for_the_same_user_agent() {
+        let mut rules = rules();
+        rules.link_token = true;
+        let limiter = test_limiter(rules, &[]);
+        let peer = Some(ip("203.0.113.7"));
+        let headers = bot_headers();
+
+        // The first suspicious request is below BURST_MAX_SUSPICIOUS; the
+        // next one is challenged, exactly like before the API carve-out.
+        assert!(limiter.check(peer, &headers, "html").is_allowed());
+        match limiter.check(peer, &headers, "html") {
+            LimiterVerdict::Challenge {
+                retry_after,
+                set_cookie,
+                ..
+            } => {
+                assert!(retry_after >= 1);
+                assert!(set_cookie.starts_with("limiter_token="));
+            }
+            other => panic!("expected Challenge, got {other:?}"),
+        }
+        let stats = limiter.stats();
+        assert_eq!(stats.allowed, 1);
+        assert_eq!(stats.challenged, 1);
+    }
+
+    #[test]
+    fn api_rate_limit_still_blocks_with_a_retry_after() {
+        let mut rules = rules();
+        rules.api_window = Duration::from_secs(60);
+        rules.api_max = 2;
+        let limiter = test_limiter(rules, &[]);
+        let peer = Some(ip("203.0.113.7"));
+        let headers = bot_headers();
+
+        assert!(limiter.check(peer, &headers, "json").is_allowed());
+        assert!(limiter.check(peer, &headers, "json").is_allowed());
+        match limiter.check(peer, &headers, "json") {
+            LimiterVerdict::Blocked {
+                retry_after,
+                message,
+            } => {
+                assert!(retry_after >= 1, "a retry delay is reported");
+                assert!(
+                    message.contains("API_WINDOW"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        // The refusal is counted for /stats.
+        let stats = limiter.stats();
+        assert_eq!(stats.allowed, 2);
+        assert_eq!(stats.blocked, 1);
     }
 
     #[test]

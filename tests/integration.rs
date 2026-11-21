@@ -1010,6 +1010,32 @@ async fn the_rate_limiter_answers_429_after_the_limit() {
 }
 
 #[tokio::test]
+async fn the_rate_limiter_sets_retry_after_on_a_limited_json_request() {
+    let base_url = start_fake_engine().await;
+    let mut settings = settings_for(&base_url);
+    settings.server.limiter = LimiterSettings::Enabled(true);
+    // The smallest window (1 s) keeps the test free of sleeps: one request
+    // over the limit is refused straight away with the remaining delay.
+    settings.server.limiter_window = 1;
+    settings.server.limiter_max = 1;
+    let app = app(settings);
+
+    let (status, _, _) = get_uri(&app, "/search?q=rust&format=json&full=1").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, headers) = get_uri(&app, "/search?q=rust&format=json&full=1").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = headers
+        .get(header::RETRY_AFTER)
+        .expect("a 429 answers with Retry-After")
+        .to_str()
+        .expect("Retry-After is ASCII")
+        .parse::<u64>()
+        .expect("Retry-After is an integer number of seconds");
+    assert!(retry_after >= 1, "unexpected Retry-After: {retry_after}");
+}
+
+#[tokio::test]
 async fn autocomplete_ignores_unknown_backends_and_shares_the_limiter() {
     let base_url = start_fake_engine().await;
     let mut settings = settings_for(&base_url);
