@@ -102,9 +102,9 @@ pub struct Network {
     host_slots: std::sync::Mutex<std::collections::HashMap<String, tokio::time::Instant>>,
     /// Concurrent media reads (`fetch_image`).
     media_slots: Arc<tokio::sync::Semaphore>,
-    /// Resolver shared by the engine clients: one lookup, and an answer that
-    /// contains a non-global address is refused unless the name is a
-    /// configured engine endpoint.
+    /// Resolver shared by the engine clients: one lookup, non-global
+    /// addresses are dropped from the answer (an answer with no global
+    /// address fails), unless the name is a configured engine endpoint.
     resolver: Arc<dyn Resolve>,
     /// Hosts of the enabled engine endpoints (base_url and search_url).
     engine_hosts: Arc<std::collections::BTreeSet<String>>,
@@ -934,7 +934,7 @@ pub fn is_documented_api_host(url: &str) -> bool {
 /// The User-Agent of an instance that identifies itself (`identified_ua`).
 pub fn identified_user_agent(contact: &str) -> String {
     let base = format!(
-        "rustxng/{} (+https://github.com/sahenjp/RustXNG",
+        "rustxng/{} (+https://github.com/RustXNG/RustXNG",
         env!("CARGO_PKG_VERSION")
     );
     match contact.trim() {
