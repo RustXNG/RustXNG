@@ -1746,3 +1746,49 @@ async fn readyz_is_not_ready_when_the_local_index_cannot_open() {
         "a directory that cannot be opened is not an index: {body}"
     );
 }
+
+/// MCP over Streamable HTTP is opt-in, and once enabled it answers the
+/// protocol's initialize request on the shared listener.
+#[tokio::test]
+async fn mcp_over_http_is_off_by_default_and_answers_when_enabled() {
+    let base_url = start_fake_engine().await;
+    let mut settings = settings_for(&base_url);
+
+    // Default: no endpoint at all.
+    assert!(!settings.mcp.http);
+    let disabled = app(settings.clone());
+    let (status, _, _) = get_uri(&disabled, "/mcp").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "MCP is opt-in");
+
+    // Enabled: the transport answers an initialize request.
+    settings.mcp.http = true;
+    let app = app(settings);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1" }
+        }
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        // The transport validates Host against its allowed list (loopback by
+        // default); oneshot does not add one.
+        .header("host", "127.0.0.1:29483")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert!(
+        response.status().is_success(),
+        "initialize failed with {}",
+        response.status()
+    );
+    let text = body_text(response).await;
+    assert!(text.contains("rustxng"), "server info is missing: {text}");
+}

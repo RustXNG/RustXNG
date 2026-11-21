@@ -9,6 +9,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::cache::{MAX_REPLY_DEPTH, bounded_resp_length};
 use crate::engine::{
     Engine, EngineDefaults, EngineError, EngineItem, EngineMeta, EngineRequest, EngineResponse,
 };
@@ -338,6 +339,15 @@ impl Connection {
     }
 
     fn read_reply(&mut self) -> Result<Reply, EngineError> {
+        self.read_reply_bounded(0)
+    }
+
+    fn read_reply_bounded(&mut self, depth: usize) -> Result<Reply, EngineError> {
+        if depth > MAX_REPLY_DEPTH {
+            return Err(EngineError::Message(format!(
+                "valkey: reply nested deeper than {MAX_REPLY_DEPTH}"
+            )));
+        }
         let mut line = String::new();
         self.reader.read_line(&mut line).map_err(Self::io_error)?;
         if line.is_empty() {
@@ -349,30 +359,50 @@ impl Connection {
             '+' => Reply::Simple(rest),
             '-' => return Err(EngineError::Message(format!("valkey: {rest}"))),
             ':' => Reply::Integer(rest.parse().unwrap_or(0)),
-            '$' => {
-                let length: i64 = rest.parse().unwrap_or(-1);
-                if length < 0 {
-                    Reply::Nil
-                } else {
-                    let mut buffer = vec![0u8; length as usize + 2];
+            '$' => match resp_bulk_length(&rest)? {
+                None => Reply::Nil,
+                Some(length) => {
+                    let mut buffer = vec![0u8; length + 2];
                     self.reader
                         .read_exact(&mut buffer)
                         .map_err(Self::io_error)?;
-                    buffer.truncate(length as usize);
+                    buffer.truncate(length);
                     Reply::Bulk(Some(String::from_utf8_lossy(&buffer).to_string()))
                 }
-            }
+            },
             '*' => {
-                let count: i64 = rest.parse().unwrap_or(0);
+                let count = resp_element_count(&rest)?;
                 let mut items = Vec::new();
-                for _ in 0..count.max(0) {
-                    items.push(self.read_reply()?);
+                for _ in 0..count {
+                    items.push(self.read_reply_bounded(depth + 1)?);
                 }
                 Reply::Array(items)
             }
             _ => Reply::Nil,
         })
     }
+}
+
+/// The byte length of one bulk reply, or `None` for the RESP nil bulk.
+fn resp_bulk_length(header: &str) -> Result<Option<usize>, EngineError> {
+    if header.starts_with('-') {
+        return Ok(None);
+    }
+    bounded_resp_length(header, crate::cache::MAX_BULK_LENGTH)
+        .map(Some)
+        .map_err(|error| EngineError::Message(format!("valkey: {error}")))
+}
+
+/// The element count of one array reply header.
+fn resp_element_count(header: &str) -> Result<usize, EngineError> {
+    // A negative count is the RESP nil array, which carries no elements.
+    if header.starts_with('-') {
+        return Ok(0);
+    }
+    // One element is at least three bytes on the wire, so the bulk limit also
+    // caps how many elements a reply may claim.
+    bounded_resp_length(header, crate::cache::MAX_BULK_LENGTH / 3)
+        .map_err(|error| EngineError::Message(format!("valkey: {error}")))
 }
 
 #[cfg(test)]
@@ -489,6 +519,36 @@ mod tests {
 
     fn parsed(query: &str) -> Query {
         Query::parse(query, &crate::engine::EngineRegistry::default(), &[])
+    }
+
+    #[test]
+    fn an_oversized_bulk_header_fails_the_search_instead_of_allocating() {
+        let (port, _requests) = stub(vec!["*2\r\n$4\r\nname\r\n$999999999999\r\n"]);
+        let engine = engine_at(port, "", true);
+        let error = engine
+            .search_offline(&parsed("user1"), 1)
+            .expect_err("a length the peer invented must not be trusted");
+        assert!(
+            error.to_string().contains("exceeds the"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_deeply_nested_reply_fails_the_search() {
+        let mut nested = String::new();
+        for _ in 0..MAX_REPLY_DEPTH + 2 {
+            nested.push_str("*1\r\n");
+        }
+        let (port, _requests) = stub(vec![Box::leak(nested.into_boxed_str())]);
+        let engine = engine_at(port, "", true);
+        let error = engine
+            .search_offline(&parsed("user1"), 1)
+            .expect_err("nesting must be bounded");
+        assert!(
+            error.to_string().contains("nested deeper"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

@@ -11,6 +11,12 @@ Usage:
     python3 tools/eval_quality.py --base http://127.0.0.1:8905
     python3 tools/eval_quality.py --base http://127.0.0.1:8905 \
         --params "strategy=staged&max_results=10" --json bench/quality-staged.json
+    python3 tools/eval_quality.py --questions bench/quality-multilingual.json \
+        --by-lang
+
+--by-lang additionally groups hit@1 / hit@5 / MRR@10 by each question's lang
+field. The default report is unchanged, so recorded numbers for the existing
+question files stay comparable.
 """
 
 from __future__ import annotations
@@ -63,6 +69,34 @@ def search(base: str, query: str, extra: dict[str, str], timeout: float, retain_
 
 def hit_rank(urls: list[str], gold: list[str]) -> int | None:
     return first_hit_rank(urls[:10], gold)
+
+
+def summarize(rows: list[dict]) -> dict:
+    """Quality counters for one slice of a run (all questions or one language)."""
+    total = len(rows)
+    hits5 = sum(1 for row in rows if row["rank"] is not None and row["rank"] <= 5)
+    hits1 = sum(1 for row in rows if row["rank"] == 1)
+    mrr = sum(1.0 / row["rank"] for row in rows if row["rank"] is not None) / total
+    latencies = [row["millis"] for row in rows]
+    return {
+        "questions": total,
+        "hit@1": hits1,
+        "hit@5": hits5,
+        "mrr@10": round(mrr, 3),
+        "median_ms": round(statistics.median(latencies), 1) if latencies else 0,
+    }
+
+
+def by_language(rows: list[dict]) -> dict[str, dict]:
+    """Group rows by their lang field, in the order the languages first appear.
+
+    Rows without the field go under "unknown", so a mixed file still reports
+    every question exactly once.
+    """
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("lang") or "unknown"), []).append(row)
+    return {lang: summarize(group) for lang, group in grouped.items()}
 
 
 def restart_instance(binary: str, port: int, base: str, attempts: int = 40) -> None:
@@ -126,6 +160,11 @@ def main() -> int:
         "suspensions from the run itself do not pollute the later questions",
     )
     parser.add_argument("--restart-every", type=int, default=20)
+    parser.add_argument(
+        "--by-lang",
+        action="store_true",
+        help="group hit@1 / hit@5 / MRR by each question's lang field",
+    )
     parser.add_argument("--port", type=int, default=8979)
     parser.add_argument("--retain-payload", action="store_true", help="Retain the complete JSON response for offline payload-budget comparisons")
     args = parser.parse_args()
@@ -190,9 +229,20 @@ def main() -> int:
         "errors": sum(1 for row in rows if row.get("error")),
         "rows": rows,
     }
+    if args.by_lang:
+        report["by_language"] = by_language(rows)
     print()
     print(f"questions={total}  hit@1={hits1}/{total}  hit@5={hits5}/{total}  MRR@10={mrr:.3f}")
     print(f"median latency={report['median_ms']} ms  median response={report['median_bytes']} B  errors={report['errors']}")
+    if args.by_lang:
+        print("by language:")
+        for lang, group in report["by_language"].items():
+            count = group["questions"]
+            print(
+                f"  {lang:<8} questions={count:<3} hit@1={group['hit@1']}/{count}  "
+                f"hit@5={group['hit@5']}/{count}  MRR@10={group['mrr@10']:.3f}  "
+                f"median={group['median_ms']:.0f} ms"
+            )
     if args.json_path:
         Path(args.json_path).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"wrote {args.json_path}")

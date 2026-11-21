@@ -598,6 +598,37 @@ fn decode_response(payload: &str) -> Option<CachedResponse> {
     })
 }
 
+/// Upper bound on one RESP bulk argument this process reads.
+///
+/// A peer names the length in the header, so without a bound a single line
+/// such as `$999999999999\r\n` makes the reader reserve that many bytes
+/// before a payload ever arrives. Cached documents are capped well below this.
+pub(crate) const MAX_BULK_LENGTH: usize = 64 * 1024 * 1024;
+
+/// Upper bound on the RESP array nesting a reply may ask for.
+pub(crate) const MAX_REPLY_DEPTH: usize = 8;
+
+/// One parsed RESP length or count header, checked against `limit`.
+///
+/// The header is untrusted: it is a decimal integer the peer chooses. A value
+/// that does not parse, is negative, or is larger than `limit` fails the read
+/// instead of being turned into an allocation.
+pub(crate) fn bounded_resp_length(header: &str, limit: usize) -> Result<usize, String> {
+    let value: i64 = header
+        .parse()
+        .map_err(|_| format!("resp: {header:?} is not a length"))?;
+    if value < 0 {
+        return Err(format!("resp: negative length {value}"));
+    }
+    let length = usize::try_from(value).map_err(|_| format!("resp: length {value} overflows"))?;
+    if length > limit {
+        return Err(format!(
+            "resp: length {length} exceeds the {limit} byte limit"
+        ));
+    }
+    Ok(length)
+}
+
 /// A tiny RESP client over a Tokio stream.
 struct ValkeyConnection {
     reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
@@ -648,18 +679,22 @@ impl ValkeyConnection {
             .flush()
             .await
             .map_err(|error| error.to_string())?;
-        self.read_reply().await
+        self.read_reply(0).await
     }
 
     fn read_reply(
         &mut self,
+        depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ValkeyReply, String>> + Send + '_>>
     {
-        Box::pin(self.read_reply_inner())
+        Box::pin(self.read_reply_inner(depth))
     }
 
-    async fn read_reply_inner(&mut self) -> Result<ValkeyReply, String> {
+    async fn read_reply_inner(&mut self, depth: usize) -> Result<ValkeyReply, String> {
         use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+        if depth > MAX_REPLY_DEPTH {
+            return Err(format!("resp: reply nested deeper than {MAX_REPLY_DEPTH}"));
+        }
         let mut line = String::new();
         self.reader
             .read_line(&mut line)
@@ -675,30 +710,47 @@ impl ValkeyConnection {
             '-' => return Err(format!("cache: {rest}")),
             ':' => ValkeyReply::Integer(rest.parse().unwrap_or(0)),
             '$' => {
-                let length: i64 = rest.parse().unwrap_or(-1);
-                if length < 0 {
-                    ValkeyReply::Nil
-                } else {
-                    let mut buffer = vec![0u8; length as usize + 2];
-                    self.reader
-                        .read_exact(&mut buffer)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    buffer.truncate(length as usize);
-                    ValkeyReply::Bulk(Some(String::from_utf8_lossy(&buffer).to_string()))
-                }
+                let Some(length) = resp_bulk_length(&rest)? else {
+                    return Ok(ValkeyReply::Nil);
+                };
+                let mut buffer = vec![0u8; length + 2];
+                self.reader
+                    .read_exact(&mut buffer)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                buffer.truncate(length);
+                ValkeyReply::Bulk(Some(String::from_utf8_lossy(&buffer).to_string()))
             }
             '*' => {
-                let count: i64 = rest.parse().unwrap_or(0);
+                let count = resp_element_count(&rest)?;
                 let mut items = Vec::new();
-                for _ in 0..count.max(0) {
-                    items.push(self.read_reply().await?);
+                for _ in 0..count {
+                    items.push(self.read_reply(depth + 1).await?);
                 }
                 ValkeyReply::Array(items)
             }
             _ => ValkeyReply::Nil,
         })
     }
+}
+
+/// The byte length of one bulk reply, or `None` for the RESP nil bulk.
+fn resp_bulk_length(header: &str) -> Result<Option<usize>, String> {
+    if header.starts_with('-') {
+        return Ok(None);
+    }
+    bounded_resp_length(header, MAX_BULK_LENGTH).map(Some)
+}
+
+/// The element count of one array reply header.
+fn resp_element_count(header: &str) -> Result<usize, String> {
+    // A negative count is the RESP nil array, which carries no elements.
+    if header.starts_with('-') {
+        return Ok(0);
+    }
+    // One element is at least three bytes on the wire, so the bulk limit also
+    // caps how many elements a reply may claim.
+    bounded_resp_length(header, MAX_BULK_LENGTH / 3)
 }
 
 enum ValkeyReply {
@@ -752,6 +804,75 @@ mod valkey_tests {
             command.push(String::from_utf8(argument).unwrap());
         }
         command
+    }
+
+    #[test]
+    fn resp_lengths_are_bounded_before_anything_is_allocated() {
+        assert_eq!(bounded_resp_length("12", 1024).unwrap(), 12);
+        assert_eq!(bounded_resp_length("0", 1024).unwrap(), 0);
+        // The reported abort: a header alone must not buy an allocation.
+        assert!(bounded_resp_length("999999999999", 1024).is_err());
+        assert!(bounded_resp_length("-5", 1024).is_err());
+        assert!(bounded_resp_length("1e9", 1024).is_err());
+        assert!(bounded_resp_length("", 1024).is_err());
+        assert!(bounded_resp_length("9223372036854775808", usize::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_bulk_header_fails_the_read_instead_of_allocating() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            assert_eq!(
+                read_command(&mut stream).await,
+                ["GET", "rustxng:cache:key"]
+            );
+            stream
+                .get_mut()
+                .write_all(
+                    b"$999999999999
+",
+                )
+                .await
+                .unwrap();
+            // The client must hang up instead of waiting for the payload.
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest).await;
+        });
+        let cache = Cache::valkey(&url, Duration::from_secs(60));
+        assert!(cache.get("key").await.is_none());
+        server.await.unwrap();
+        assert_eq!(cache.stats().error, 1);
+    }
+
+    #[tokio::test]
+    async fn a_deeply_nested_reply_fails_the_read() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            assert_eq!(
+                read_command(&mut stream).await,
+                ["GET", "rustxng:cache:key"]
+            );
+            let mut nested = String::new();
+            for _ in 0..MAX_REPLY_DEPTH + 2 {
+                nested.push_str(
+                    "*1
+",
+                );
+            }
+            stream.get_mut().write_all(nested.as_bytes()).await.unwrap();
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest).await;
+        });
+        let cache = Cache::valkey(&url, Duration::from_secs(60));
+        assert!(cache.get("key").await.is_none());
+        server.await.unwrap();
+        assert_eq!(cache.stats().error, 1);
     }
 
     #[tokio::test]

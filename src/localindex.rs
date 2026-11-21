@@ -5,11 +5,12 @@ mod mixed_script;
 
 use std::path::Path;
 
-use tantivy::collector::TopDocs;
+use tantivy::collector::{DocSetCollector, TopDocs};
 use tantivy::directory::MmapDirectory;
 use tantivy::indexer::UserOperation;
 use tantivy::query::{
-    BooleanQuery, BoostQuery, ConstScoreQuery, Occur, Query, QueryParser, RegexQuery, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, Occur, Query, QueryParser, RegexQuery,
+    TermQuery,
 };
 use tantivy::schema::{
     Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
@@ -34,7 +35,12 @@ pub struct Hit {
     pub url: String,
     pub title: String,
     pub snippet: String,
+    /// BM25 score, optionally blended with the semantic score by the caller.
     pub score: f32,
+    /// Cosine similarity between the query and this page, set by the caller
+    /// that holds an embeddings endpoint. None when the hit was ranked by
+    /// BM25 alone.
+    pub semantic: Option<f32>,
 }
 
 /// Weight of a title match against a body match.
@@ -47,7 +53,11 @@ const PHRASE_BOOST: f32 = 2.0;
 const SNIPPET_CHARS: usize = 300;
 pub(crate) const MAX_SEARCH_WINDOW: usize = 10_000;
 /// Bumped whenever the schema changes; an older index must be rebuilt.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// 3 added `indexed_at`, the time each document was indexed.
+pub const SCHEMA_VERSION: u32 = 3;
+/// Seconds since the Unix epoch when a document was written.
+const INDEXED_AT: &str = "indexed_at";
 
 /// A name for the CJK tokenizer, registered once per index.
 const BIGRAM: &str = "bigram";
@@ -62,6 +72,7 @@ struct Fields {
     lang: Field,
     url_text: Field,
     snippet: Field,
+    indexed_at: Field,
 }
 
 /// An opened local index.
@@ -102,6 +113,8 @@ fn build_schema() -> Schema {
     // tutorial") match pages whose URL says so.
     builder.add_text_field("url_text", plain_url);
     builder.add_text_field("snippet", STORED);
+    // Not indexed: only read back when a crawl asks how old a page is.
+    builder.add_u64_field(INDEXED_AT, STORED);
     builder.build()
 }
 
@@ -185,7 +198,10 @@ impl LocalIndex {
             None
         };
         let schema = index.schema();
-        if schema.get_field("snippet").is_err() || schema.get_field("url_text").is_err() {
+        if schema.get_field("snippet").is_err()
+            || schema.get_field("url_text").is_err()
+            || schema.get_field(INDEXED_AT).is_err()
+        {
             return Err(format!(
                 "the index at {path:?} was built by an older version (schema < {SCHEMA_VERSION}); rebuild it with `rustxng-index crawl`"
             ));
@@ -213,6 +229,9 @@ impl LocalIndex {
             snippet: schema
                 .get_field("snippet")
                 .map_err(|error| error.to_string())?,
+            indexed_at: schema
+                .get_field(INDEXED_AT)
+                .map_err(|error| error.to_string())?,
         };
         Ok(Self {
             index,
@@ -231,19 +250,72 @@ impl LocalIndex {
     /// Lets a later crawl continue where the previous one stopped instead of
     /// indexing the same pages twice.
     pub fn has_url(&self, url: &str) -> bool {
+        matches!(self.stored_document(url), Ok(Some(_)))
+    }
+
+    /// When this URL was indexed, in seconds since the Unix epoch.
+    ///
+    /// Lets a crawl skip pages that are already fresh instead of downloading
+    /// them again (`--since`).
+    pub fn indexed_at(&self, url: &str) -> Result<Option<u64>, String> {
+        let Some(document) = self.stored_document(url)? else {
+            return Ok(None);
+        };
+        Ok(document
+            .get_first(self.fields.indexed_at)
+            .and_then(|value| value.as_u64()))
+    }
+
+    /// Every indexed URL, sorted. Used by a crawl's deletion pass.
+    pub fn urls(&self) -> Result<Vec<String>, String> {
+        let searcher = self.reader.searcher();
+        let addresses = searcher
+            .search(&AllQuery, &DocSetCollector)
+            .map_err(|error| format!("list documents: {error}"))?;
+        let mut urls = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let document: tantivy::TantivyDocument = searcher
+                .doc(address)
+                .map_err(|error| format!("doc: {error}"))?;
+            let url = document
+                .get_first(self.fields.url)
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default();
+            if !url.is_empty() {
+                urls.push(url);
+            }
+        }
+        urls.sort();
+        Ok(urls)
+    }
+
+    /// The stored document of one URL, if the index holds it.
+    fn stored_document(&self, url: &str) -> Result<Option<tantivy::TantivyDocument>, String> {
         let searcher = self.reader.searcher();
         let query = TermQuery::new(
             Term::from_field_text(self.fields.url, url),
             IndexRecordOption::Basic,
         );
-        searcher
+        let hits = searcher
             .search(&query, &TopDocs::with_limit(1).order_by_score())
-            .map(|hits| !hits.is_empty())
-            .unwrap_or(false)
+            .map_err(|error| format!("find document: {error}"))?;
+        let Some((_, address)) = hits.first() else {
+            return Ok(None);
+        };
+        searcher
+            .doc(*address)
+            .map(Some)
+            .map_err(|error| format!("doc: {error}"))
     }
 
     /// Replace this URL's page. Changes become visible after commit.
     pub fn add(&self, page: &Page<'_>) -> Result<(), String> {
+        self.add_at(page, indexed_now())
+    }
+
+    /// Add a page with a given index time. Tests pin the stamp; production
+    /// goes through [`add`](Self::add).
+    fn add_at(&self, page: &Page<'_>, indexed_at: u64) -> Result<(), String> {
         let writer = self.writer.as_ref().ok_or("index opened read-only")?;
         let writer = writer.lock().map_err(|_| "writer poisoned")?;
         let snippet = if page.snippet.is_empty() {
@@ -260,6 +332,7 @@ impl LocalIndex {
             self.fields.title_ja => cjk_only(page.title),
             self.fields.body_ja => cjk_only(page.body),
             self.fields.lang => page.lang.to_string(),
+            self.fields.indexed_at => indexed_at,
         );
         writer
             .run([
@@ -428,6 +501,7 @@ impl LocalIndex {
                 title: text(self.fields.title),
                 snippet: text(self.fields.snippet),
                 score,
+                semantic: None,
             });
         }
         Ok(hits)
@@ -492,6 +566,14 @@ impl LocalIndex {
         }
         Ok(Box::new(BooleanQuery::union(queries)))
     }
+}
+
+/// Seconds since the Unix epoch, the index time stored per document.
+fn indexed_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 /// Words too common to say anything about the topic of a query.
@@ -806,6 +888,49 @@ mod tests {
         Index::create_in_dir(dir.path(), builder.build()).unwrap();
         let error = LocalIndex::open(dir.path()).err().expect("must fail");
         assert!(error.contains("older version"), "{error}");
+    }
+
+    #[test]
+    fn documents_record_when_they_were_indexed_and_can_be_listed() {
+        let (_dir, index) = temp_index();
+        index
+            .add_at(
+                &page("https://b.example/two", "Two", "second"),
+                1_700_000_200,
+            )
+            .unwrap();
+        index
+            .add_at(
+                &page("https://a.example/one", "One", "first"),
+                1_700_000_100,
+            )
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(
+            index.indexed_at("https://a.example/one").unwrap(),
+            Some(1_700_000_100)
+        );
+        assert_eq!(index.indexed_at("https://missing.example/").unwrap(), None);
+        assert_eq!(
+            index.urls().unwrap(),
+            vec![
+                "https://a.example/one".to_string(),
+                "https://b.example/two".to_string()
+            ]
+        );
+
+        // The normal write path stamps the document with the current time.
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        index
+            .add(&page("https://c.example/now", "Now", "recent"))
+            .unwrap();
+        index.commit().unwrap();
+        let stamped = index.indexed_at("https://c.example/now").unwrap().unwrap();
+        assert!(stamped >= before, "{stamped} < {before}");
+        assert_eq!(index.urls().unwrap().len(), 3);
     }
 
     #[test]

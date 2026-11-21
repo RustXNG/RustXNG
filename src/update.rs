@@ -6,6 +6,8 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::fetch::is_fetchable;
+
 const API: &str = "https://api.github.com/repos/RustXNG/RustXNG/releases/latest";
 const DOWNLOAD_PREFIX: &str = "https://github.com/RustXNG/RustXNG/releases/download/";
 const MAX_BINARY: usize = 256 * 1024 * 1024;
@@ -86,10 +88,33 @@ fn verify(bytes: &[u8], checksum: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Hop limit for the update downloads: metadata, checksum and executable.
+const MAX_REDIRECTS: usize = 10;
+
+/// Refuse a download destination that is not a public http(s) address.
+///
+/// The destinations are fixed constants and every asset must also carry the
+/// expected prefix, but reqwest follows redirects on its own. A redirect is a
+/// destination this process did not choose, so each hop gets the same literal
+/// check the fetch paths apply, and the client keeps its own resolver, which
+/// drops non-global addresses after the lookup.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        if !is_fetchable(attempt.url()) {
+            return attempt.error("redirect target is not a public address");
+        }
+        attempt.follow()
+    })
+}
+
 /// Check or install the newest stable release without loading server settings.
 pub async fn run(install: bool) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .https_only(true)
+        .redirect(redirect_policy())
         .user_agent(concat!("rustxng/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(180))
@@ -151,6 +176,25 @@ mod tests {
         assert!(release_version("v0.26.10").unwrap() > release_version("v0.26.9").unwrap());
         assert!(release_version("../../bad").is_err());
         assert!(asset_name("v1.0.0").contains(env!("RUSTXNG_BUILD_TARGET")));
+    }
+
+    #[test]
+    fn a_redirect_away_from_a_public_address_is_refused() {
+        // The policy body is exercised through the same predicates the
+        // download client uses, since reqwest owns the attempt loop.
+        let public = reqwest::Url::parse(DOWNLOAD_PREFIX).expect("url");
+        assert!(is_fetchable(&public));
+        assert!(!is_fetchable(
+            &reqwest::Url::parse("https://127.0.0.1/asset").expect("url")
+        ));
+        assert!(!is_fetchable(
+            &reqwest::Url::parse("http://169.254.169.254/latest/meta-data").expect("url")
+        ));
+        assert!(!is_fetchable(
+            &reqwest::Url::parse("file:///etc/passwd").expect("url")
+        ));
+        assert_eq!(MAX_REDIRECTS, 10);
+        let _ = redirect_policy();
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::Cache;
-use crate::engine::state::{EngineSnapshot, EngineStates};
+use crate::engine::state::{CircuitAdmission, CircuitState, EngineSnapshot, EngineStates};
 use crate::engine::{EngineHandle, EngineItem, EngineRegistry, FailureKind};
 use crate::metrics::Metrics;
 use crate::network::Network;
@@ -184,6 +184,18 @@ struct EngineOutcome {
     items: Result<Vec<EngineItem>, FailureKind>,
     elapsed: Duration,
     suspended: bool,
+    /// Overrides the reported error type. The circuit breaker skips an engine
+    /// without a `FailureKind` of its own, and "unexpected error" would hide
+    /// the reason from the result page.
+    reason: Option<&'static str>,
+}
+
+/// Result label for an engine the circuit breaker left out of the rotation.
+fn circuit_reason(state: CircuitState) -> &'static str {
+    match state {
+        CircuitState::HalfOpen => "circuit half-open",
+        _ => "circuit open",
+    }
 }
 
 /// Runs searches against the configured engines.
@@ -760,9 +772,10 @@ impl Searcher {
             match outcome.items {
                 Ok(items) => container.extend(&outcome.engine, outcome.weight, items),
                 Err(kind) => {
+                    let error_type = outcome.reason.unwrap_or_else(|| kind.error_type());
                     container.add_unresponsive_engine(
                         &outcome.engine,
-                        kind.error_type(),
+                        error_type,
                         outcome.suspended,
                     );
                 }
@@ -837,6 +850,13 @@ impl Searcher {
             hits.truncate(LOCAL_PAGE_SIZE);
             if source == "local_index" && !request.is_single_source() {
                 hits = cap_per_host(hits, MAX_PER_HOST);
+            }
+            // The merge keeps only the position of these hits, not their BM25
+            // score, so this is the last point where a local-index hit can
+            // carry a semantic score. A named source keeps its own order, and
+            // without an embeddings endpoint nothing is requested.
+            if !request.is_single_source() && !engines.is_empty() {
+                self.blend_index_hits(&request.query, &mut hits).await;
             }
             let items: Vec<EngineItem> = hits
                 .into_iter()
@@ -1033,10 +1053,10 @@ impl Searcher {
                 items: Err(kind),
                 elapsed: Duration::ZERO,
                 suspended: true,
+                reason: None,
             };
         }
 
-        let started = Instant::now();
         // engine ごとの timeout は残り時間で上限を切る。締め切りを過ぎていれば走らせない。
         let Some(timeout) = engine_budget(engine.timeout(), deadline, Instant::now()) else {
             return EngineOutcome {
@@ -1045,8 +1065,35 @@ impl Searcher {
                 items: Err(FailureKind::Timeout),
                 elapsed: Duration::ZERO,
                 suspended: false,
+                reason: None,
             };
         };
+
+        // The circuit is the softer layer behind the suspension check: an
+        // engine the window judged unhealthy waits here until its trial.
+        // The budget check above runs first so a trial is never consumed by a
+        // search that will not start the engine.
+        match self.states.circuit_admission(&name, &self.settings.search) {
+            CircuitAdmission::Allow | CircuitAdmission::Trial => {}
+            CircuitAdmission::Skip { state, remaining } => {
+                tracing::debug!(
+                    engine = %name,
+                    circuit = state.as_str(),
+                    remaining = ?remaining,
+                    "engine circuit open, skipping"
+                );
+                return EngineOutcome {
+                    engine: name,
+                    weight,
+                    items: Err(FailureKind::Other),
+                    elapsed: Duration::ZERO,
+                    suspended: true,
+                    reason: Some(circuit_reason(state)),
+                };
+            }
+        }
+
+        let started = Instant::now();
 
         Metrics::incr(&self.metrics.engine_requests, 1);
         let items = self.run_engine_inner(engine, request, timeout).await;
@@ -1073,6 +1120,7 @@ impl Searcher {
             items,
             elapsed,
             suspended: false,
+            reason: None,
         }
     }
 
@@ -1194,6 +1242,7 @@ impl Searcher {
                     items: Err(FailureKind::Timeout),
                     elapsed: Duration::ZERO,
                     suspended: false,
+                    reason: None,
                 })
             })
             .collect()
@@ -1250,6 +1299,9 @@ impl Searcher {
             let stats = &snapshot.stats;
             let rank = if snapshot.suspended {
                 3
+            } else if snapshot.circuit == CircuitState::Open {
+                // The circuit skips it anyway; do not spend a tier on it.
+                4
             } else if stats.requests == 0 {
                 1
             } else if stats.results > 0 {
@@ -1405,6 +1457,44 @@ impl Searcher {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results
+    }
+
+    /// Blend the embeddings cosine into the BM25 order of local index hits.
+    ///
+    /// The merge keeps only the position of a hit, not its BM25 score, so this
+    /// is the last point where a local-index hit can carry a semantic score.
+    /// It runs only when an embeddings endpoint is configured; without one
+    /// nothing is requested and the hits keep the BM25 order.
+    async fn blend_index_hits(&self, query: &Query, hits: &mut [crate::localindex::Hit]) {
+        let settings = &self.settings.search;
+        let topk = hits.len().min(settings.embedding_topk);
+        if settings.embedding_url.is_empty() || topk < 2 {
+            return;
+        }
+        let mut texts = Vec::with_capacity(topk + 1);
+        texts.push(query.query_text());
+        for hit in &hits[..topk] {
+            let snippet: String = hit.snippet.chars().take(240).collect();
+            texts.push(format!("{} {snippet}", hit.title));
+        }
+        let vectors = match self.embed(&texts).await {
+            Ok(vectors) if vectors.len() == texts.len() => vectors,
+            Ok(_) | Err(_) => {
+                tracing::warn!("local index embedding re-ranking skipped (bad response)");
+                return;
+            }
+        };
+        let query_vec = &vectors[0];
+        for (index, hit) in hits.iter_mut().take(topk).enumerate() {
+            let cosine = dot(query_vec, &vectors[index + 1]);
+            hit.semantic = Some(cosine as f32);
+            hit.score += (settings.embedding_weight * cosine) as f32;
+        }
+        hits[..topk].sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     /// Ask the embeddings endpoint for one vector per input text.
@@ -1580,9 +1670,14 @@ pub fn unresponsive_text(error_type: &str, suspended: bool) -> String {
         "parsing error" => "Parsing error".to_string(),
         "suspended" => "Suspended".to_string(),
         "resting" => "Resting: no results lately".to_string(),
+        "circuit open" => "Circuit open: skipped after repeated failures".to_string(),
+        "circuit half-open" => "Circuit half-open: trial in progress".to_string(),
         _ => "Unexpected error".to_string(),
     };
-    if suspended && text != "Suspended" && error_type != "resting" {
+    // A resting engine and an open circuit already say why they are out of
+    // the rotation; prefixing "Suspended:" would only repeat that.
+    let explains_itself = error_type == "resting" || error_type.starts_with("circuit ");
+    if suspended && !explains_itself && text != "Suspended" {
         text = format!("Suspended: {text}");
     }
     text
@@ -1960,6 +2055,156 @@ mod orchestration_tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// An embeddings endpoint that gives the query and pages containing
+    /// `marker` the same vector and every other page an orthogonal one.
+    async fn marker_embeddings(
+        marker: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let inputs = body
+                        .get("input")
+                        .and_then(|value| value.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let data: Vec<serde_json::Value> = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, input)| {
+                            let text = input.as_str().unwrap_or_default();
+                            let vector = if index == 0 || text.contains(marker) {
+                                vec![1.0, 0.0]
+                            } else {
+                                vec![0.0, 1.0]
+                            };
+                            serde_json::json!({ "index": index, "embedding": vector })
+                        })
+                        .collect();
+                    axum::Json(serde_json::json!({ "data": data }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, calls, server)
+    }
+
+    #[tokio::test]
+    async fn a_local_index_merge_without_embeddings_keeps_bm25_order_and_scores() {
+        let (_directory, searcher) = with_local_index(vec![]);
+        let index = searcher.local_index.as_ref().unwrap();
+        index
+            .add(&crate::localindex::Page {
+                url: "https://docs.example/notes",
+                title: "Notes",
+                body: "The needle appears once here.",
+                lang: "en",
+                snippet: "",
+            })
+            .unwrap();
+        index.commit().unwrap();
+        // Without an endpoint nothing is requested and the merge keeps the
+        // index's own order and the position fusion it had before.
+        assert!(searcher.settings.search.embedding_url.is_empty());
+        let ranked: Vec<String> = index
+            .search("needle", 5)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.url)
+            .collect();
+        let mut request = SearchRequest::new(query("needle", &searcher.registry));
+        request.engines = vec!["local_index".into()];
+        let response = searcher.search(request).await;
+        assert!(response.error.is_none());
+        assert_eq!(response.engines, ["local_index"]);
+        let merged: Vec<String> = response
+            .results
+            .iter()
+            .map(|result| result.url.clone())
+            .collect();
+        assert_eq!(merged, ranked);
+        assert_eq!(response.results[0].score, 1.0);
+        assert_eq!(response.results[1].score, 0.5);
+    }
+
+    #[tokio::test]
+    async fn a_local_index_hit_carries_the_embedding_cosine() {
+        let (address, calls, server) = marker_embeddings("Semantic guide").await;
+        let (_directory, mut searcher) = with_local_index(vec![]);
+        let index = Arc::clone(searcher.local_index.as_ref().unwrap());
+        index
+            .add(&crate::localindex::Page {
+                url: "https://docs.example/semantic",
+                title: "Semantic guide",
+                body: "The needle appears once here.",
+                lang: "en",
+                snippet: "",
+            })
+            .unwrap();
+        index.commit().unwrap();
+        Arc::make_mut(&mut searcher.settings).search.embedding_url = format!("http://{address}");
+        Arc::make_mut(&mut searcher.settings)
+            .search
+            .embedding_weight = 100.0;
+        let mut hits = index.search("needle", 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].url, "https://docs.example/needle");
+        assert!(hits.iter().all(|hit| hit.semantic.is_none()));
+        searcher
+            .blend_index_hits(&query("needle", &searcher.registry), &mut hits)
+            .await;
+        server.abort();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hits[0].url, "https://docs.example/semantic");
+        assert_eq!(hits[0].semantic, Some(1.0));
+        assert_eq!(hits[1].semantic, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn a_merged_search_blends_local_index_hits_with_embeddings() {
+        let (address, calls, server) = marker_embeddings("Semantic guide").await;
+        let remote = FakeEngine::build("remote", &["general"], 1, false);
+        let (_directory, mut searcher) = with_local_index(vec![remote]);
+        let index = Arc::clone(searcher.local_index.as_ref().unwrap());
+        index
+            .add(&crate::localindex::Page {
+                url: "https://docs.example/semantic",
+                title: "Semantic guide",
+                body: "The needle appears once here.",
+                lang: "en",
+                snippet: "",
+            })
+            .unwrap();
+        index.commit().unwrap();
+        Arc::make_mut(&mut searcher.settings).search.embedding_url = format!("http://{address}");
+        Arc::make_mut(&mut searcher.settings)
+            .search
+            .embedding_weight = 100.0;
+        let response = searcher
+            .search(SearchRequest::new(query("needle", &searcher.registry)))
+            .await;
+        server.abort();
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the configured endpoint must be asked"
+        );
+        assert_eq!(response.engines, ["remote", "local_index"]);
+        assert_eq!(response.results[0].url, "https://docs.example/semantic");
+    }
+
     #[tokio::test]
     async fn explicit_remote_sources_do_not_merge_unrequested_indexes() {
         let first = FakeEngine::build("first", &["general"], 1, false);
@@ -2028,6 +2273,7 @@ mod orchestration_tests {
             ))]),
             elapsed: Duration::ZERO,
             suspended: false,
+            reason: None,
         };
         let request = SearchRequest::new(query("rust", &searcher.registry));
         let mut tasks = tokio::task::JoinSet::new();
@@ -2089,6 +2335,7 @@ mod orchestration_tests {
             title: String::new(),
             snippet: String::new(),
             score: 1.0,
+            semantic: None,
         };
         let same = (0..5).map(|i| hit("docs.example", i)).collect();
         assert_eq!(cap_per_host(same, 3).len(), 5);
@@ -2546,6 +2793,41 @@ mod orchestration_tests {
             "too many requests"
         );
     }
+
+    #[tokio::test]
+    async fn an_open_circuit_skips_the_engine_with_a_reason() {
+        let engine = FakeEngine::build("flaky", &["general"], 1, false);
+        let mut searcher = searcher(vec![engine.clone()]);
+        Arc::make_mut(&mut searcher.settings).search.circuit = crate::settings::CircuitSettings {
+            window: 2,
+            minimum_samples: 2,
+            failure_ratio: 1.0,
+            ..crate::settings::CircuitSettings::default()
+        };
+        // Two soft failures in a window of two open the circuit.
+        searcher
+            .states
+            .record_failure("flaky", FailureKind::Timeout, &searcher.settings.search);
+        searcher
+            .states
+            .record_failure("flaky", FailureKind::Timeout, &searcher.settings.search);
+
+        let request = SearchRequest::new(query("cats", &searcher.registry));
+        let response = searcher.search(request).await;
+
+        assert!(response.results.is_empty(), "the engine never ran");
+        assert!(
+            engine.queries.lock().unwrap().is_empty(),
+            "the circuit kept the request from being built"
+        );
+        let entry = response
+            .unresponsive_engines
+            .iter()
+            .find(|entry| entry.engine == "flaky")
+            .expect("the skipped engine is still reported");
+        assert_eq!(entry.error_type, "circuit open");
+        assert!(entry.suspended, "a skipped engine is reported as suspended");
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -2560,6 +2842,14 @@ mod tests {
             "Suspended: Parsing error"
         );
         assert_eq!(unresponsive_text("timeout", false), "Timeout");
+        assert_eq!(
+            unresponsive_text("circuit open", true),
+            "Circuit open: skipped after repeated failures"
+        );
+        assert_eq!(
+            unresponsive_text("circuit half-open", true),
+            "Circuit half-open: trial in progress"
+        );
         assert_eq!(
             unresponsive_text("anything else", false),
             "Unexpected error"

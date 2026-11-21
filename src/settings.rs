@@ -98,6 +98,8 @@ pub struct Settings {
     /// Page fetching for MCP `read_page` and HTTP `include_raw_content`.
     #[serde(default)]
     pub fetch: FetchSettings,
+    /// Model Context Protocol exposure.
+    pub mcp: McpSettings,
     /// Categories shown as tabs (upstream `categories_as_tabs`).
     #[serde(default, deserialize_with = "string_or_seq")]
     pub categories_as_tabs: Vec<String>,
@@ -160,6 +162,21 @@ pub enum FetchProvider {
 }
 
 /// Page fetching configuration for MCP `read_page` and HTTP raw content.
+/// Model Context Protocol exposure (`[mcp]`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpSettings {
+    /// Serve MCP over Streamable HTTP at `/mcp` on the HTTP listener.
+    ///
+    /// Off by default: the endpoint hands a remote agent the same fetch
+    /// capability as `read_page`, so a public instance opts in knowingly.
+    pub http: bool,
+    /// Host authorities accepted for the MCP endpoint. Empty keeps the
+    /// transport default (loopback only), which is what a local instance
+    /// wants; a reverse proxy has to name its public host here.
+    pub allowed_hosts: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct FetchSettings {
@@ -429,6 +446,81 @@ fn all_locale_tags() -> Vec<String> {
         .collect()
 }
 
+/// `[search.circuit]`: the statistical circuit breaker in front of the engines.
+///
+/// Hard blocks (access denied, CAPTCHA, 429) suspend an engine outright
+/// through `search.suspended_times`. The circuit is the softer layer: it looks
+/// at the last `window` outcomes and opens when too many of them failed, so an
+/// engine that times out or returns unparsable pages half of the time leaves
+/// the rotation for a while instead of costing every search its deadline.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CircuitSettings {
+    /// Enable the breaker. Disabled leaves every engine in the rotation.
+    pub enabled: bool,
+    /// Number of recent outcomes the failure rate is measured over.
+    pub window: usize,
+    /// Failure share of the window that opens the circuit (0 < ratio <= 1).
+    pub failure_ratio: f64,
+    /// Outcomes needed before the ratio is trusted.
+    pub minimum_samples: usize,
+    /// First open period in seconds. Every failed half-open trial doubles it.
+    pub open_seconds: u64,
+    /// Ceiling of the doubling open period in seconds.
+    pub max_open_seconds: u64,
+}
+
+impl CircuitSettings {
+    /// Upper bound of `window`; larger values are clamped when used.
+    pub const MAX_WINDOW: usize = 1_000;
+    /// Upper bound of both open periods. Matches the suspension ceiling.
+    pub const MAX_OPEN_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+    /// Window size that is always usable, even when validation was skipped.
+    pub fn effective_window(&self) -> usize {
+        self.window.clamp(1, Self::MAX_WINDOW)
+    }
+
+    /// Failure ratio that is always usable. A non-finite value never opens
+    /// early; it behaves like "only open when everything failed".
+    pub fn effective_failure_ratio(&self) -> f64 {
+        if self.failure_ratio.is_finite() {
+            self.failure_ratio.clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Minimum sample count, never above the window it is compared against.
+    pub fn effective_minimum_samples(&self) -> usize {
+        self.minimum_samples.clamp(1, self.effective_window())
+    }
+
+    /// First open period in seconds, at least one.
+    pub fn effective_open_seconds(&self) -> u64 {
+        self.open_seconds.clamp(1, Self::MAX_OPEN_SECONDS)
+    }
+
+    /// Ceiling of the open period, never below the first step.
+    pub fn effective_max_open_seconds(&self) -> u64 {
+        self.max_open_seconds
+            .clamp(self.effective_open_seconds(), Self::MAX_OPEN_SECONDS)
+    }
+}
+
+impl Default for CircuitSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window: 20,
+            failure_ratio: 0.6,
+            minimum_samples: 10,
+            open_seconds: 30,
+            max_open_seconds: 600,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Search {
@@ -523,6 +615,8 @@ pub struct Search {
     pub embedding_weight: f64,
     /// How many of the top results are re-ranked by embedding similarity.
     pub embedding_topk: usize,
+    /// The statistical circuit breaker in front of the engines.
+    pub circuit: CircuitSettings,
 }
 
 /// Behaviour of the JavaScript page renderer when rendering fails.
@@ -604,6 +698,7 @@ impl Default for Search {
             authority_weight: 8.0,
             embedding_weight: 2.5,
             embedding_topk: 25,
+            circuit: CircuitSettings::default(),
         }
     }
 }
@@ -1149,6 +1244,7 @@ impl Settings {
         }
         self.validate_cache()?;
         self.validate_suspension()?;
+        self.validate_circuit()?;
         self.validate_research()?;
         self.validate_base_url()?;
         let mut names: BTreeMap<&str, &str> = BTreeMap::new();
@@ -1211,6 +1307,60 @@ impl Settings {
         if self.search.empty_result_cooldown > MAX_SUSPENSION_SECONDS {
             return Err(SettingsError::Validation(format!(
                 "search.empty_result_cooldown must be at most {MAX_SUSPENSION_SECONDS} seconds"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The circuit breaker must be usable as configured. Values outside the
+    /// ranges the breaker supports would either never open it or leave an
+    /// engine out of the rotation with no way back, so they are errors rather
+    /// than silently clamped.
+    fn validate_circuit(&self) -> Result<(), SettingsError> {
+        let circuit = &self.search.circuit;
+        if circuit.window == 0 || circuit.window > CircuitSettings::MAX_WINDOW {
+            return Err(SettingsError::Validation(format!(
+                "search.circuit.window must be 1-{}, got {}",
+                CircuitSettings::MAX_WINDOW,
+                circuit.window
+            )));
+        }
+        if !circuit.failure_ratio.is_finite()
+            || circuit.failure_ratio <= 0.0
+            || circuit.failure_ratio > 1.0
+        {
+            return Err(SettingsError::Validation(format!(
+                "search.circuit.failure_ratio must be in (0, 1], got {}",
+                circuit.failure_ratio
+            )));
+        }
+        if circuit.minimum_samples == 0 {
+            return Err(SettingsError::Validation(
+                "search.circuit.minimum_samples must be greater than 0".into(),
+            ));
+        }
+        if circuit.minimum_samples > circuit.window {
+            // A threshold the window can never reach would be dead config.
+            return Err(SettingsError::Validation(format!(
+                "search.circuit.minimum_samples ({}) must not exceed search.circuit.window ({})",
+                circuit.minimum_samples, circuit.window
+            )));
+        }
+        if circuit.open_seconds == 0 || circuit.open_seconds > CircuitSettings::MAX_OPEN_SECONDS {
+            return Err(SettingsError::Validation(format!(
+                "search.circuit.open_seconds must be 1-{} seconds, got {}",
+                CircuitSettings::MAX_OPEN_SECONDS,
+                circuit.open_seconds
+            )));
+        }
+        if circuit.max_open_seconds < circuit.open_seconds
+            || circuit.max_open_seconds > CircuitSettings::MAX_OPEN_SECONDS
+        {
+            return Err(SettingsError::Validation(format!(
+                "search.circuit.max_open_seconds must be {}-{} seconds, got {}",
+                circuit.open_seconds,
+                CircuitSettings::MAX_OPEN_SECONDS,
+                circuit.max_open_seconds
             )));
         }
         Ok(())
@@ -2211,6 +2361,70 @@ engines:
         let mut settings = Settings::defaults();
         settings.search.empty_result_cooldown = 366 * 24 * 60 * 60;
         assert!(settings.validate().is_err(), "the cooldown is bounded too");
+    }
+
+    #[test]
+    fn the_circuit_breaker_is_validated_and_clamped() {
+        let mut settings = Settings::defaults();
+        assert_eq!(settings.search.circuit, CircuitSettings::default());
+        assert_eq!(settings.search.circuit, Search::default().circuit);
+        settings
+            .validate()
+            .expect("the shipped circuit settings are valid");
+
+        settings.search.circuit.window = 0;
+        assert!(settings.validate().is_err(), "a zero window has no samples");
+        settings.search.circuit = CircuitSettings::default();
+
+        settings.search.circuit.failure_ratio = 0.0;
+        assert!(
+            settings.validate().is_err(),
+            "a zero ratio would open on a clean window"
+        );
+        settings.search.circuit.failure_ratio = 1.5;
+        assert!(settings.validate().is_err(), "a ratio is a share of one");
+        settings.search.circuit.failure_ratio = f64::NAN;
+        assert!(
+            settings.validate().is_err(),
+            "a non-finite ratio is rejected"
+        );
+        settings.search.circuit = CircuitSettings::default();
+
+        settings.search.circuit.minimum_samples = 0;
+        assert!(settings.validate().is_err());
+        settings.search.circuit.minimum_samples = 21;
+        assert!(
+            settings.validate().is_err(),
+            "a threshold the window cannot reach is dead config"
+        );
+        settings.search.circuit = CircuitSettings::default();
+
+        settings.search.circuit.open_seconds = 0;
+        assert!(settings.validate().is_err());
+        settings.search.circuit.open_seconds = 30;
+        settings.search.circuit.max_open_seconds = 29;
+        assert!(
+            settings.validate().is_err(),
+            "the ceiling cannot be below the first step"
+        );
+        settings.search.circuit.max_open_seconds = CircuitSettings::MAX_OPEN_SECONDS + 1;
+        assert!(settings.validate().is_err(), "the ladder is bounded");
+
+        // Hand-built values are clamped instead of panicking, so a library
+        // caller that skipped validation cannot divide by zero.
+        let clamped = CircuitSettings {
+            window: 0,
+            minimum_samples: 0,
+            failure_ratio: 2.0,
+            open_seconds: 0,
+            max_open_seconds: 0,
+            ..CircuitSettings::default()
+        };
+        assert_eq!(clamped.effective_window(), 1);
+        assert_eq!(clamped.effective_minimum_samples(), 1);
+        assert_eq!(clamped.effective_failure_ratio(), 1.0);
+        assert_eq!(clamped.effective_open_seconds(), 1);
+        assert_eq!(clamped.effective_max_open_seconds(), 1);
     }
 
     #[test]

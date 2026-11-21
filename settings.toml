@@ -127,6 +127,24 @@ cf_SearxEngineCaptcha = 3600
 cf_SearxEngineAccessDenied = 3600
 recaptcha_SearxEngineCaptcha = 3600
 
+# --- サーキットブレーカー（統計レイヤ）---
+# 401/403/429/CAPTCHA は上の suspended_times で即休止する。こちらは
+# タイムアウト・解析失敗・HTTP エラーのように「時々失敗する」エンジンを、
+# 直近の結果から外す。開いた回路は open_seconds 後に半開になり、1 回だけ
+# 試す。その試行が成功すれば閉じ、失敗すれば待ち時間を倍にして開き直す
+# （上限 max_open_seconds）。403 などの hard block はこの窓には数えない。
+[search.circuit]
+enabled = true
+# 直近何回の結果を窓として見るか
+window = 20
+# 窓の失敗率がこの値以上で開く（0 < failure_ratio <= 1）
+failure_ratio = 0.6
+# これだけ結果が貯まるまでは失敗率を判断しない（window 以下）
+minimum_samples = 10
+# 最初に閉じる秒数。半開の試行に失敗するたびに倍になる
+open_seconds = 30
+max_open_seconds = 600
+
 [ui]
 default_theme = "simple"
 default_locale = "en"
@@ -2470,3 +2488,12 @@ shortcut = "bjp"
 categories = ["general", "web"]
 mkt = "ja-JP"
 disabled = true
+
+# Model Context Protocol。
+# http = true で HTTP リスナーに /mcp を公開する（既定 false）。
+# リモートのエージェントへ read_page と同じ取得能力を渡すため、既定では閉じる。
+# allowed_hosts は受け付ける Host。空なら loopback のみ（DNS リバインディング対策）。
+# リバースプロキシ配下では公開ホスト名を列挙する。
+[mcp]
+http = false
+allowed_hosts = []
