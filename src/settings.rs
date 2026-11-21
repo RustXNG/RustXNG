@@ -35,6 +35,33 @@ pub const DEFAULT_SETTINGS: &str = include_str!("../settings.toml");
 /// Formats the `/search` endpoint can render (upstream `OUTPUT_FORMATS`).
 pub static OUTPUT_FORMATS: &[&str] = &["html", "csv", "json", "rss"];
 
+/// Accept a list of categories or one comma separated string.
+///
+/// Upstream's YAML accepts a scalar here, and a list that was accidentally
+/// written as a string must stay one category ("general"), not fall apart into
+/// its characters. ``["general"]`` and ``"general"`` therefore mean the same.
+fn string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrSeq {
+        String(String),
+        Seq(Vec<String>),
+    }
+
+    Ok(match StringOrSeq::deserialize(deserializer)? {
+        StringOrSeq::String(text) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect(),
+        StringOrSeq::Seq(items) => items,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
     #[error("could not read settings file {path}: {source}")]
@@ -72,6 +99,7 @@ pub struct Settings {
     #[serde(default)]
     pub fetch: FetchSettings,
     /// Categories shown as tabs (upstream `categories_as_tabs`).
+    #[serde(default, deserialize_with = "string_or_seq")]
     pub categories_as_tabs: Vec<String>,
     /// Accepted for compatibility with SearXNG configs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -514,15 +542,17 @@ pub enum SearchStrategy {
 
 impl Default for Search {
     fn default() -> Self {
+        // First suspension of a hard block. Repeats escalate in
+        // `EngineStates`: 1 h -> 6 h -> 24 h -> 7 days, reset by a success.
         let mut suspended_times = BTreeMap::new();
-        suspended_times.insert("SearxEngineAccessDenied".into(), 86_400);
-        suspended_times.insert("SearxEngineCaptcha".into(), 86_400);
+        suspended_times.insert("SearxEngineAccessDenied".into(), 3_600);
+        suspended_times.insert("SearxEngineCaptcha".into(), 3_600);
         // A 429 usually clears in minutes; an hour is far too punishing for
         // a good engine such as Yahoo! JAPAN (upstream defaults to 3600).
         suspended_times.insert("SearxEngineTooManyRequests".into(), 300);
-        suspended_times.insert("cf_SearxEngineCaptcha".into(), 1_296_000);
-        suspended_times.insert("cf_SearxEngineAccessDenied".into(), 86_400);
-        suspended_times.insert("recaptcha_SearxEngineCaptcha".into(), 604_800);
+        suspended_times.insert("cf_SearxEngineCaptcha".into(), 3_600);
+        suspended_times.insert("cf_SearxEngineAccessDenied".into(), 3_600);
+        suspended_times.insert("recaptcha_SearxEngineCaptcha".into(), 3_600);
         Self {
             safe_search: 0,
             autocomplete: "duckduckgo".into(),
@@ -691,7 +721,8 @@ pub struct EngineConfig {
     pub engine: String,
     #[serde(default)]
     pub shortcut: Option<String>,
-    #[serde(default)]
+    /// One category or a list; a string is split on commas.
+    #[serde(default, deserialize_with = "string_or_seq")]
     pub categories: Vec<String>,
     /// `None` means "not specified"; an explicit `false` re-enables an engine
     /// that ships disabled in the defaults.
@@ -785,11 +816,6 @@ impl EngineConfig {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// Shortcut falling back to the engine id, like upstream.
-    pub fn shortcut_or_name(&self) -> String {
-        self.shortcut.clone().unwrap_or_else(|| self.engine.clone())
     }
 }
 
@@ -1125,6 +1151,20 @@ impl Settings {
                     engine.name
                 )));
             }
+            // The historical one-character split turned "general" into 7
+            // categories. A real category is never a single character, so a
+            // list that consists only of them is a string split by mistake.
+            if !engine.categories.is_empty()
+                && engine
+                    .categories
+                    .iter()
+                    .all(|category| category.chars().count() == 1)
+            {
+                return Err(SettingsError::Validation(format!(
+                    "engine {:?}: categories {:?} look like a string split into characters; write [\"general\"]",
+                    engine.name, engine.categories
+                )));
+            }
             if let Some(previous) = names.insert(engine.name.as_str(), engine.engine.as_str()) {
                 return Err(SettingsError::Validation(format!(
                     "duplicate engine name {:?} ({previous} and {})",
@@ -1268,6 +1308,38 @@ impl Settings {
                 "research.enabled = true without research.api_key: /research returns evidence only"
                     .to_string(),
             );
+        }
+        // These keys are parsed so that a SearXNG configuration keeps
+        // loading, but this port never reads them. A value that differs from
+        // the built-in default is called out instead of silently doing nothing.
+        let unimplemented =
+            |key: &str| format!("{key} is accepted for compatibility but not implemented");
+        if self.general.debug {
+            warnings.push(unimplemented("general.debug"));
+        }
+        if self
+            .server
+            .http_protocol_version
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            warnings.push(unimplemented("server.http_protocol_version"));
+        }
+        let outgoing = Outgoing::default();
+        if self.outgoing.pool_connections != outgoing.pool_connections {
+            warnings.push(unimplemented("outgoing.pool_connections"));
+        }
+        if self.outgoing.keepalive_expiry != outgoing.keepalive_expiry {
+            warnings.push(unimplemented("outgoing.keepalive_expiry"));
+        }
+        if self.ui.search_on_category_select != Ui::default().search_on_category_select {
+            warnings.push(unimplemented("ui.search_on_category_select"));
+        }
+        if self.ui.hotkeys != Ui::default().hotkeys {
+            warnings.push(unimplemented("ui.hotkeys"));
+        }
+        if self.doi_resolvers.is_some() {
+            warnings.push(unimplemented("doi_resolvers"));
         }
         warnings
     }
@@ -1594,8 +1666,8 @@ SearxEngineTooManyRequests = 60
 
         let suspended = &settings.search.suspended_times;
         assert_eq!(suspended.get("SearxEngineTooManyRequests"), Some(&60));
-        assert_eq!(suspended.get("SearxEngineCaptcha"), Some(&86_400));
-        assert_eq!(suspended.get("cf_SearxEngineCaptcha"), Some(&1_296_000));
+        assert_eq!(suspended.get("SearxEngineCaptcha"), Some(&3_600));
+        assert_eq!(suspended.get("cf_SearxEngineCaptcha"), Some(&3_600));
     }
 
     #[test]
@@ -1648,6 +1720,90 @@ content_xpath = "//p"
         let settings = merged_toml("categories_as_tabs = [\"general\"]\n");
 
         assert_eq!(settings.categories_as_tabs, vec!["general".to_string()]);
+    }
+
+    #[test]
+    fn a_scalar_category_is_a_single_category() {
+        // TOML
+        let toml_settings = merged_toml(
+            r#"
+categories_as_tabs = "general"
+
+[[engines]]
+name = "scalar categories"
+engine = "wikipedia"
+categories = "general"
+"#,
+        );
+        assert_eq!(toml_settings.categories_as_tabs, ["general"]);
+        assert_eq!(
+            toml_settings
+                .engine("scalar categories")
+                .expect("engine kept")
+                .categories,
+            ["general"]
+        );
+
+        // YAML, the upstream format
+        let yaml_settings = merged_yaml(
+            r#"
+categories_as_tabs: general
+engines:
+  - name: scalar categories
+    engine: wikipedia
+    categories: general
+"#,
+        );
+        assert_eq!(yaml_settings.categories_as_tabs, ["general"]);
+        assert_eq!(
+            yaml_settings
+                .engine("scalar categories")
+                .expect("engine kept")
+                .categories,
+            ["general"]
+        );
+    }
+
+    #[test]
+    fn a_comma_separated_category_scalar_is_split() {
+        let settings = merged_toml(
+            r#"
+[[engines]]
+name = "comma categories"
+engine = "wikipedia"
+categories = "general, images"
+"#,
+        );
+        assert_eq!(
+            settings
+                .engine("comma categories")
+                .expect("engine kept")
+                .categories,
+            ["general", "images"]
+        );
+    }
+
+    #[test]
+    fn a_one_character_category_list_names_the_engine() {
+        let mut settings = Settings::defaults();
+        let name = settings.engines[0].name.clone();
+        settings.engines[0].categories = "general"
+            .chars()
+            .map(|character| character.to_string())
+            .collect();
+
+        let error = settings.validate().expect_err("a split string is rejected");
+        assert!(error.to_string().contains(&name), "{error}");
+        assert!(
+            error.to_string().contains("split into characters"),
+            "{error}"
+        );
+
+        // A real list, including a one-word category, stays valid.
+        settings.engines[0].categories = vec!["general".into()];
+        settings
+            .validate()
+            .expect("a normal category list is valid");
     }
 
     #[test]
@@ -2080,6 +2236,49 @@ engines:
                 .iter()
                 .any(|warning| warning.contains("api_key")),
             "research without a key is called out"
+        );
+    }
+
+    #[test]
+    fn unimplemented_settings_are_reported_once_each() {
+        let mut settings = Settings::defaults();
+        settings.general.debug = true;
+        settings.server.http_protocol_version = Some("1.1".into());
+        settings.outgoing.pool_connections = 7;
+        settings.outgoing.keepalive_expiry = 1.0;
+        settings.ui.search_on_category_select = false;
+        settings.ui.hotkeys = "vim".into();
+        settings.doi_resolvers = Some(toml::Table::new());
+
+        let warnings = settings.warnings();
+        for key in [
+            "general.debug",
+            "server.http_protocol_version",
+            "outgoing.pool_connections",
+            "outgoing.keepalive_expiry",
+            "ui.search_on_category_select",
+            "ui.hotkeys",
+            "doi_resolvers",
+        ] {
+            let matching: Vec<&String> = warnings
+                .iter()
+                .filter(|warning| warning.contains(key))
+                .collect();
+            assert_eq!(matching.len(), 1, "{key}: {warnings:?}");
+            assert!(
+                matching[0].contains("accepted for compatibility but not implemented"),
+                "{key}: {warnings:?}"
+            );
+        }
+
+        // The built-in defaults do not trigger these warnings.
+        assert!(
+            Settings::defaults()
+                .warnings()
+                .iter()
+                .all(|warning| !warning.contains("accepted for compatibility")),
+            "{:?}",
+            Settings::defaults().warnings()
         );
     }
 

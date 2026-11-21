@@ -2,6 +2,10 @@
 # Everything here can be overridden by a user file passed with `--config` or
 # `SEARXNG_SETTINGS_PATH`. See README.md and docs/PORTING.md.
 
+# 上部タブに出すカテゴリ。スカラー文字列（"general"）でも配列でもよい。
+# テーブル見出し（[general] など）より前のトップレベルに置くこと。
+categories_as_tabs = ["general", "images", "videos", "news", "map", "music", "it", "science", "files", "social media"]
+
 [general]
 debug = false
 instance_name = "RustXNG"
@@ -103,6 +107,18 @@ authority_weight = 8.0
 # 何件の上位結果を埋め込みで並べ替えるか
 embedding_topk = 25
 
+# 休止時間の初期値（秒）。CAPTCHA やアクセス拒否などの hard block は、
+# 同じエンジンで繰り返すと 1 時間 → 6 時間 → 24 時間 → 7 日 と延びる
+# （上限 7 日、成功するとリセット）。ここに書いた値は最初の休止だけを上書きする。
+# 429 は短い 300 秒から始まり、繰り返すと同じくバックオフする。
+[search.suspended_times]
+SearxEngineAccessDenied = 3600
+SearxEngineCaptcha = 3600
+SearxEngineTooManyRequests = 300
+cf_SearxEngineCaptcha = 3600
+cf_SearxEngineAccessDenied = 3600
+recaptcha_SearxEngineCaptcha = 3600
+
 [ui]
 default_theme = "simple"
 default_locale = "en"
@@ -182,8 +198,6 @@ api_key = ""
 [plugins]
 enabled = []
 disabled = []
-
-categories_as_tabs = ["general", "images", "videos", "news", "map", "music", "it", "science", "files", "social media"]
 
 # ---------------------------------------------------------------------------
 # Engines

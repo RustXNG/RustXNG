@@ -85,7 +85,7 @@ Yahoo! JAPANとMojeekのアダプターは残します。利用者が明示的�
 | 変更 | 内容 |
 | --- | --- |
 | NAVER・Keenable・Swisscows を既定無効 | NAVER は公表規約との整合が未確認。Keenable は API キーがなくても公開エンドポイントを呼ぶ。Swisscows は署名付きエンドポイントの第三者利用が未確認。有効化する場合は先に許可・条件を確認してください |
-| API 提供元には識別できる User-Agent を送る | Wikimedia 系、GitHub、crates.io、PyPI、npm、Crossref、OpenAlex、Semantic Scholar、StackExchange、arXiv、Openverse、OSM（Nominatim・Photon）、Open-Meteo 宛ての通信は、ブラウザ風のローテーションではなく `rustxng/<版> (+https://github.com/sahenjp/RustXNG[; 連絡先])` を使う。連絡先は `[outgoing] contact` |
+| API 提供元には識別できる User-Agent を送る | Wikimedia 系、GitHub、crates.io、PyPI、npm、Crossref、OpenAlex、Semantic Scholar、StackExchange、arXiv、Openverse、OSM（Nominatim・Photon）、Open-Meteo 宛ての通信は、ブラウザ風のローテーションではなく `rustxng/<版> (+https://github.com/RustXNG/RustXNG[; 連絡先])` を使う。連絡先は `[outgoing] contact` |
 | `read_page` / 生本文取得 | 識別できる User-Agent を使い、robots.txt（RFC 9309）に従う。robots.txt に到達できない場合のみ、利用者が求めたページは取得を続ける |
 | カテゴリ指定の誤り 22 件を修正 | `categories = ["g","e","n",...]` のように 1 文字ずつの配列になっていた。20 件は設定上有効だったが、実際にはどのカテゴリにも属していなかった。**修正後も、これまで一度も動いていないことを踏まえて 20 件とも既定無効にした**（有効化は各プロバイダーの確認後） |
 | 比較表現の修正 | `settings.toml` のコメントから他社サービスとの優劣を示す記述を除いた |
@@ -171,3 +171,11 @@ Yahoo! JAPANを外した場合の性能低下量を表すものではありま�
 元の観測は履歴として保存し、[URL照合を修正した再集計](BENCHMARK-RESCORE-2026-11-03.md)も別に公開します。
 
 追加の認証・クォータ・帰属・保持条件は、[2026-11-05の取得先別確認記録](PROVIDER-EVIDENCE-2026-11-05.md)に記録しています。
+
+## 2026-11-21の休止時間の変更
+
+CAPTCHA・アクセス拒否による休止は固定期間（1日〜15日）をやめ、エンジンごとの指数バックオフにしました。
+最初の休止は `[search.suspended_times]` の値（既定1時間、429は300秒）を使い、同じエンジンで繰り返すと
+1時間 → 6時間 → 24時間 → 7日（上限）と延び、成功した検索でリセットされます。
+休止中のエンジンは結果ページと JSON の `suspended_engines` に理由と残り秒数を表示します。
+接続先や利用条件は変更していません。

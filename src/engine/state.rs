@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 use super::FailureKind;
 use crate::settings::Search;
 
+/// Consecutive suspensions of one engine climb this ladder and stop at the
+/// last entry: 1 h, 6 h, 24 h, 7 days. The first suspension uses the window
+/// from `search.suspended_times` and later steps never go below it. A
+/// successful request resets the ladder.
+const SUSPENSION_BACKOFF_SECONDS: [u64; 4] = [3_600, 21_600, 86_400, 604_800];
+
 /// Counters kept per engine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EngineStats {
@@ -43,6 +49,9 @@ struct EngineState {
     quiet_until: Option<Instant>,
     suspended_until: Option<Instant>,
     suspension_reason: Option<String>,
+    /// Number of consecutive hard-block suspensions, the backoff ladder
+    /// position. Reset by a successful request.
+    suspension_streak: u64,
     stats: EngineStats,
 }
 
@@ -117,6 +126,7 @@ impl EngineStates {
     ) {
         self.with_state(engine, |state| {
             state.consecutive_failures = 0;
+            state.suspension_streak = 0;
             if results == 0 {
                 state.empty_streak += 1;
                 if settings.empty_result_limit > 0
@@ -152,7 +162,23 @@ impl EngineStates {
             state.consecutive_failures += 1;
 
             let suspension = match kind.suspension_key() {
-                Some(key) => settings.suspended_times.get(key).copied().unwrap_or(3_600),
+                Some(key) => {
+                    let configured = settings.suspended_times.get(key).copied().unwrap_or(3_600);
+                    // The configured window overrides the first step and stays
+                    // the floor afterwards, so a previously long window never
+                    // shrinks on the second repeat.
+                    let seconds = if state.suspension_streak == 0 {
+                        configured
+                    } else {
+                        SUSPENSION_BACKOFF_SECONDS[(state.suspension_streak as usize)
+                            .min(SUSPENSION_BACKOFF_SECONDS.len() - 1)]
+                        .max(configured)
+                    };
+                    if seconds > 0 {
+                        state.suspension_streak = state.suspension_streak.saturating_add(1);
+                    }
+                    seconds
+                }
                 None => {
                     // Repeated soft failures degrade into a short suspension,
                     // exactly like upstream's ban_time_on_fail.
@@ -224,12 +250,84 @@ mod tests {
     use super::*;
 
     #[test]
-    fn access_denied_suspends_for_a_day() {
+    fn access_denied_suspends_for_an_hour() {
         let states = EngineStates::new();
         let settings = Search::default();
         let seconds = states.record_failure("duckduckgo", FailureKind::AccessDenied, &settings);
-        assert_eq!(seconds, 86_400);
+        assert_eq!(seconds, 3_600);
         assert!(states.suspension("duckduckgo").is_some());
+    }
+
+    #[test]
+    fn repeated_captchas_back_off_to_seven_days() {
+        let states = EngineStates::new();
+        let settings = Search::default();
+        let ladder: Vec<u64> = (0..6)
+            .map(|_| states.record_failure("eng", FailureKind::Captcha, &settings))
+            .collect();
+
+        // 1 h -> 6 h -> 24 h -> 7 days, then the cap repeats.
+        assert_eq!(ladder, [3_600, 21_600, 86_400, 604_800, 604_800, 604_800]);
+    }
+
+    #[test]
+    fn a_configured_window_overrides_the_first_step_only() {
+        let states = EngineStates::new();
+        let mut settings = Search::default();
+        settings
+            .suspended_times
+            .insert("SearxEngineCaptcha".into(), 7_200);
+
+        let first = states.record_failure("eng", FailureKind::Captcha, &settings);
+        let second = states.record_failure("eng", FailureKind::Captcha, &settings);
+        assert_eq!(first, 7_200, "the configured value is the first step");
+        assert_eq!(second, 21_600, "repeats use the shared ladder");
+
+        // A long configured window (the historical one-day default) never
+        // shrinks to the 6 h ladder step on the second repeat.
+        let mut settings = Search::default();
+        settings
+            .suspended_times
+            .insert("SearxEngineCaptcha".into(), 86_400);
+        let states = EngineStates::new();
+        let ladder: Vec<u64> = (0..5)
+            .map(|_| states.record_failure("eng", FailureKind::Captcha, &settings))
+            .collect();
+        assert_eq!(ladder, [86_400, 86_400, 86_400, 604_800, 604_800]);
+    }
+
+    #[test]
+    fn a_success_resets_the_backoff_ladder() {
+        let states = EngineStates::new();
+        let settings = Search::default();
+        states.record_failure("eng", FailureKind::Captcha, &settings);
+        states.record_failure("eng", FailureKind::Captcha, &settings);
+        states.record_success("eng", 1, Duration::from_millis(50), &settings);
+
+        let again = states.record_failure("eng", FailureKind::Captcha, &settings);
+        assert_eq!(again, 3_600, "a success starts the ladder over");
+    }
+
+    #[test]
+    fn too_many_requests_keeps_its_short_first_window_and_backs_off() {
+        let states = EngineStates::new();
+        let settings = Search::default();
+
+        let first = states.record_failure("eng", FailureKind::TooManyRequests, &settings);
+        let second = states.record_failure("eng", FailureKind::TooManyRequests, &settings);
+        assert_eq!(first, 300);
+        assert!(
+            second > first,
+            "a repeated 429 must back off, got {second} after {first}"
+        );
+        assert_eq!(second, 21_600);
+
+        // A soft failure does not advance the hard-block ladder.
+        let fresh = EngineStates::new();
+        fresh.record_failure("eng", FailureKind::Other, &settings);
+        fresh.record_failure("eng", FailureKind::Other, &settings);
+        let captcha = fresh.record_failure("eng", FailureKind::Captcha, &settings);
+        assert_eq!(captcha, 3_600);
     }
 
     #[test]

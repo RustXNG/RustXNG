@@ -93,6 +93,13 @@
 </section>
 {% endif %}
 
+{% if has_suspended %}
+<section class="suspended">
+  <p>Engines paused after a block or rate limit:</p>
+  <ul>{% for entry in suspended_engines %}<li>{{ entry.engine }}: {{ entry.reason }} &mdash; {{ entry.seconds_remaining }} s remaining</li>{% endfor %}</ul>
+</section>
+{% endif %}
+
 {% if has_timings %}
 <details>
   <summary>Timings</summary>
