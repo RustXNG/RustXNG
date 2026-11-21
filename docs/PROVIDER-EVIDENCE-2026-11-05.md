@@ -45,10 +45,10 @@ Wibyの台帳は設定名と `json_engine` モジュール・接続先の組で�
 
 ## 評価とIssueの完了条件
 
-- [#63](https://github.com/sahenjp/RustXNG/issues/63): 今回は上表の提供元に証拠と未完了事項を追加。残りの提供元も同じ粒度で確認し、運用条件を満たす必要があります。
-- [#16](https://github.com/sahenjp/RustXNG/issues/16): Bingの市場固定は実装済みですが、追加市場の既定有効化には取得・再利用の確認が必要です。[Bing Search APIの終了](https://learn.microsoft.com/en-us/lifecycle/announcements/bing-search-api-retirement)を回避するためにHTML経路へ許諾が移ることはありません。
-- [#40](https://github.com/sahenjp/RustXNG/issues/40): 比較ツールの事前検証とリクエスト計画は[#106](https://github.com/sahenjp/RustXNG/pull/106)で扱います。テンプレート30例と既存の6問は未見評価の代替ではありません。独立して収集した実際の診断、固定した基準エンジン、権利を確認した構成、反復実測が残ります。
-- [#104](https://github.com/sahenjp/RustXNG/issues/104): この追補に新しい検索品質の測定値はありません。許諾を確認した検索元または独立索引で、多言語・鮮度の未見設問を評価する必要があります。既存100問の回復やExa超えは主張しません。
+- [#63](https://github.com/RustXNG/RustXNG/issues/63): 今回は上表の提供元に証拠と未完了事項を追加。残りの提供元も同じ粒度で確認し、運用条件を満たす必要があります。
+- [#16](https://github.com/RustXNG/RustXNG/issues/16): Bingの市場固定は実装済みですが、追加市場の既定有効化には取得・再利用の確認が必要です。[Bing Search APIの終了](https://learn.microsoft.com/en-us/lifecycle/announcements/bing-search-api-retirement)を回避するためにHTML経路へ許諾が移ることはありません。
+- [#40](https://github.com/RustXNG/RustXNG/issues/40): 比較ツールの事前検証とリクエスト計画は[#106](https://github.com/RustXNG/RustXNG/pull/106)で扱います。テンプレート30例と既存の6問は未見評価の代替ではありません。独立して収集した実際の診断、固定した基準エンジン、権利を確認した構成、反復実測が残ります。
+- [#104](https://github.com/RustXNG/RustXNG/issues/104): この追補に新しい検索品質の測定値はありません。許諾を確認した検索元または独立索引で、多言語・鮮度の未見設問を評価する必要があります。既存100問の回復やExa超えは主張しません。
 
 外部測定では、実行日時、コード・設定・設問のハッシュ、実際のエンジン一覧、
 キャッシュと索引、言語・地域、キーのプランと枠、保存可能な情報の範囲を記録します。

@@ -6,8 +6,8 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const API: &str = "https://api.github.com/repos/sahenjp/RustXNG/releases/latest";
-const DOWNLOAD_PREFIX: &str = "https://github.com/sahenjp/RustXNG/releases/download/";
+const API: &str = "https://api.github.com/repos/RustXNG/RustXNG/releases/latest";
+const DOWNLOAD_PREFIX: &str = "https://github.com/RustXNG/RustXNG/releases/download/";
 const MAX_BINARY: usize = 256 * 1024 * 1024;
 
 #[derive(Deserialize)]

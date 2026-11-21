@@ -212,16 +212,6 @@ impl FailureKind {
             _ => None,
         }
     }
-
-    /// Classify a status code the way upstream does.
-    pub fn from_status(status: u16) -> Option<Self> {
-        match status {
-            401..=403 => Some(Self::AccessDenied),
-            429 => Some(Self::TooManyRequests),
-            500..=599 => Some(Self::Http),
-            _ => None,
-        }
-    }
 }
 
 impl From<&EngineError> for FailureKind {

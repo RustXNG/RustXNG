@@ -63,16 +63,6 @@ impl TimeRange {
     pub fn since(range: Option<TimeRange>) -> Option<chrono::DateTime<chrono::Utc>> {
         Self::seconds(range).map(|seconds| chrono::Utc::now() - chrono::Duration::seconds(seconds))
     }
-
-    /// The `relativedelta` keyword upstream uses for mojeek & friends.
-    pub fn as_python_delta(self) -> (&'static str, i64) {
-        match self {
-            Self::Day => ("days", 1),
-            Self::Week => ("weeks", 1),
-            Self::Month => ("months", 1),
-            Self::Year => ("years", 1),
-        }
-    }
 }
 
 /// A reference to an engine (optionally in the context of a category bang).

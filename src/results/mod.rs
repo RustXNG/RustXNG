@@ -212,11 +212,6 @@ impl SearchResult {
         self
     }
 
-    pub fn with_priority(mut self, priority: Priority) -> Self {
-        self.priority = priority;
-        self
-    }
-
     pub fn with_metadata(mut self, key: &str, value: impl Into<String>) -> Self {
         self.metadata.insert(key.to_string(), value.into());
         self
@@ -544,10 +539,6 @@ impl ResultContainer {
             total,
             load,
         });
-    }
-
-    pub fn set_redirect_url(&mut self, url: impl Into<String>) {
-        self.redirect_url = Some(url.into());
     }
 }
 

@@ -24,9 +24,6 @@ pub const KEYWORDS: &[&str] = &["tor-check", "tor_check", "torcheck", "tor", "to
 /// URL of the Tor exit node list (upstream 'url_exit_list').
 pub const URL_EXIT_LIST: &str = "https://check.torproject.org/exit-addresses";
 
-/// Human readable entry point of the exit check.
-pub const CHECK_URL: &str = "https://check.torproject.org/";
-
 /// Timeout of the exit node list request.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 

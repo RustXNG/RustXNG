@@ -48,7 +48,7 @@ import urllib.request
 import mcp_smoke
 
 DEFAULT_PORT = 29483
-GIT_URL = "https://github.com/sahenjp/RustXNG"
+GIT_URL = "https://github.com/RustXNG/RustXNG"
 HOST = "127.0.0.1"
 QUERY = "rustxng smoke"
 MAX_RESULTS = 5

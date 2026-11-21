@@ -1,6 +1,6 @@
 # SCOPE — 独立監査の対象
 
-- リポジトリ: https://github.com/sahenjp/RustXNG
+- リポジトリ: https://github.com/RustXNG/RustXNG
 - Baseline commit: `f7639ce`（v0.31.2、main）
 - Candidate: `f7639ce` 上の未コミット作業ツリー（コミットは作成していない。方針上、明示指示があるまでコミットしない）
 - 監査対象: 2026-11-16 のセッションで加えた変更（src 8 ファイル、tests、settings.toml、tools 2 ファイル、README 2 件、docs）
