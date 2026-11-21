@@ -82,6 +82,48 @@ fn check_config_reports_a_profile_without_sources() {
 }
 
 #[test]
+fn check_config_reports_the_circuit_breaker_policy() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("settings.toml");
+    std::fs::write(
+        &path,
+        "use_default_settings = false\n[search]\nlocal_index_path = \"\"\nwikipedia_index_path = \"\"\n[search.circuit]\nenabled = false\nwindow = 5\nfailure_ratio = 0.5\nminimum_samples = 4\nopen_seconds = 60\nmax_open_seconds = 120\n",
+    )
+    .expect("write settings");
+    let output = binary()
+        .args([
+            "--check-config",
+            "--config",
+            path.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("run the binary");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = json_stdout(&output);
+    assert_eq!(json["circuit"]["enabled"], false, "{json}");
+    assert_eq!(json["circuit"]["window"], 5, "{json}");
+    assert_eq!(json["circuit"]["failure_ratio"], 0.5, "{json}");
+    assert_eq!(json["circuit"]["minimum_samples"], 4, "{json}");
+    assert_eq!(json["circuit"]["open_seconds"], 60, "{json}");
+    assert_eq!(json["circuit"]["max_open_seconds"], 120, "{json}");
+    // Valid but surprising: disabling the breaker is reported as a warning.
+    assert!(
+        json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("search.circuit.enabled"))),
+        "{json}"
+    );
+}
+
+#[test]
 fn check_config_fails_on_malformed_settings() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("settings.toml");

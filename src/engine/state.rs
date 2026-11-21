@@ -296,6 +296,25 @@ pub struct EngineSnapshot {
     pub circuit_samples: u64,
 }
 
+impl EngineSnapshot {
+    /// Circuit phase as a human-readable label (see [`CircuitState::as_str`]).
+    pub fn circuit_label(&self) -> &'static str {
+        self.circuit.as_str()
+    }
+
+    /// Failure share of the rolling window as a percentage, rounded to one
+    /// decimal for display.
+    pub fn circuit_failure_percent(&self) -> f64 {
+        (self.circuit_failure_ratio * 1_000.0).round() / 10.0
+    }
+
+    /// Remaining open time rounded up to whole seconds; 0 unless the circuit
+    /// is open.
+    pub fn circuit_open_seconds(&self) -> u64 {
+        self.circuit_open_for.ceil() as u64
+    }
+}
+
 /// Thread safe map of engine states.
 #[derive(Debug, Default)]
 pub struct EngineStates {

@@ -13,8 +13,9 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use rustxng::aggregator::Searcher;
+use rustxng::engine::FailureKind;
 use rustxng::fetch::PageReader;
-use rustxng::settings::{EngineConfig, LimiterSettings, Settings};
+use rustxng::settings::{CircuitSettings, EngineConfig, LimiterSettings, Settings};
 use rustxng::web::{AppState, router};
 
 /// The JSON payload the fake Mwmbl engine answers with.
@@ -1615,6 +1616,133 @@ async fn stats_shows_recovery_from_resting() {
     let app = router(AppState::new(searcher));
     let (status, _, _) = get_uri(&app, "/stats").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// Settings with no fixed engine whose circuit opens on two failures.
+fn circuit_test_settings() -> Settings {
+    let mut settings = Settings::defaults();
+    settings.search.wikipedia_index_path = String::new();
+    settings.search.local_index_path = String::new();
+    settings.engines.clear();
+    // Keep the suspension ladder out of the way: this test is about the
+    // statistical layer, not about a hard block.
+    settings.search.ban_time_on_fail = 0;
+    settings.search.max_ban_time_on_fail = 0;
+    settings.search.circuit = CircuitSettings {
+        window: 2,
+        minimum_samples: 2,
+        failure_ratio: 1.0,
+        // A long period keeps the rendered remaining time away from the
+        // one-second boundary that a stalled test runner could cross.
+        open_seconds: 600,
+        max_open_seconds: 600,
+        ..CircuitSettings::default()
+    };
+    settings.server.secret_key = "test".to_string();
+    settings
+}
+
+#[tokio::test]
+async fn stats_endpoint_shows_the_circuit_breaker() {
+    let searcher = Searcher::new(circuit_test_settings()).expect("searcher");
+    for _ in 0..2 {
+        searcher
+            .states
+            .record_failure("testeng", FailureKind::Timeout, &searcher.settings.search);
+    }
+    let app = router(AppState::new(searcher));
+
+    let (status, body, _) = get_uri(&app, "/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    for header in ["Circuit", "Failure rate", "Samples", "Open for"] {
+        assert!(
+            body.contains(&format!("<th>{header}</th>")),
+            "the {header} column is rendered: {body}"
+        );
+    }
+    // The columns are rendered in the header order above; parse the engine
+    // row so a shifted cell cannot pass unnoticed.
+    let html = scraper::Html::parse_document(&body);
+    let row_selector = scraper::Selector::parse("tr").unwrap();
+    let cell_selector = scraper::Selector::parse("td").unwrap();
+    let row = html
+        .select(&row_selector)
+        .find(|row| row.text().any(|text| text.trim() == "testeng"))
+        .expect("the engine row is rendered");
+    let cells: Vec<String> = row
+        .select(&cell_selector)
+        .map(|cell| cell.text().collect::<String>().trim().to_string())
+        .collect();
+    assert_eq!(cells.len(), 11, "{cells:?}");
+    assert_eq!(cells[7], "open", "{cells:?}");
+    assert_eq!(cells[8], "100%", "{cells:?}");
+    assert_eq!(cells[9], "2", "{cells:?}");
+    assert!(
+        cells[10]
+            .strip_suffix('s')
+            .is_some_and(|seconds| seconds.parse::<u64>().is_ok_and(|seconds| seconds > 0)),
+        "the remaining open time is rendered in seconds: {cells:?}"
+    );
+
+    // The JSON view carries the same state, so scripts and the page agree.
+    let (status, body, _) = get_uri(&app, "/stats/errors").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let engine = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|engine| engine["engine"] == "testeng")
+        .expect("the engine is tracked");
+    assert_eq!(engine["circuit"], "open");
+    assert_eq!(engine["circuit_samples"], 2);
+    assert_eq!(engine["circuit_failure_ratio"], 1.0);
+}
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_the_circuit_breaker() {
+    let searcher = Searcher::new(circuit_test_settings()).expect("searcher");
+    for _ in 0..2 {
+        searcher
+            .states
+            .record_failure("testeng", FailureKind::Timeout, &searcher.settings.search);
+    }
+    let app = router(AppState::new(searcher));
+
+    let (status, body, _) = get_uri(&app, "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+    let label = "engine=\"testeng\"";
+    for phase in ["closed", "half-open", "open"] {
+        let expected = if phase == "open" { 1 } else { 0 };
+        assert!(
+            body.contains(&format!(
+                "searxng_engines_circuit_state{{{label},state=\"{phase}\"}} {expected}\n"
+            )),
+            "the {phase} phase is exported:\n{body}"
+        );
+    }
+    assert!(
+        body.contains(&format!(
+            "searxng_engines_circuit_failure_ratio{{{label}}} 1.000000\n"
+        )),
+        "the window failure rate is exported:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("searxng_engines_circuit_samples{{{label}}} 2\n")),
+        "the sample count is exported:\n{body}"
+    );
+    let open_seconds = body
+        .lines()
+        .find(|line| line.starts_with("searxng_engines_circuit_open_seconds{"))
+        .expect("the remaining open time is exported");
+    let value: f64 = open_seconds.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(value > 0.0 && value <= 600.0, "{open_seconds}");
+    assert!(
+        body.contains(&format!(
+            "searxng_engines_consecutive_failures{{{label}}} 2\n"
+        )),
+        "consecutive failures are exported:\n{body}"
+    );
 }
 
 #[tokio::test]

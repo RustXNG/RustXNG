@@ -1467,6 +1467,12 @@ impl Settings {
         if !self.general.enable_metrics {
             warnings.push("general.enable_metrics = false: /metrics answers 404".to_string());
         }
+        if !self.search.circuit.enabled {
+            warnings.push(
+                "search.circuit.enabled = false: engines that keep failing stay in the rotation"
+                    .to_string(),
+            );
+        }
         if self.research.enabled && self.research.api_key.trim().is_empty() {
             warnings.push(
                 "research.enabled = true without research.api_key: /research returns evidence only"

@@ -27,7 +27,7 @@
 <h3>Engines</h3>
 {% if has_engines %}
 <table>
-  <tr><th>Engine</th><th>Requests</th><th>Results</th><th>Errors</th><th>Average</th><th>Suspended</th><th>Resting</th></tr>
+  <tr><th>Engine</th><th>Requests</th><th>Results</th><th>Errors</th><th>Average</th><th>Suspended</th><th>Resting</th><th>Circuit</th><th>Failure rate</th><th>Samples</th><th>Open for</th></tr>
 {% for engine in engines %}
   <tr>
     <td>{{ engine.engine }}</td>
@@ -37,6 +37,10 @@
     <td>{{ engine.stats.total_time }}</td>
     <td>{% if engine.suspended %}yes{% else %}no{% endif %}</td>
     <td>{% if engine.resting %}empty results ({{ engine.resting_for }}s){% else %}no{% endif %}</td>
+    <td>{{ engine.circuit_label() }}</td>
+    <td>{{ engine.circuit_failure_percent() }}%</td>
+    <td>{{ engine.circuit_samples }}</td>
+    <td>{{ engine.circuit_open_seconds() }}s</td>
   </tr>
 {% endfor %}
 </table>
