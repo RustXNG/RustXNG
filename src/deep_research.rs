@@ -151,26 +151,21 @@ fn parse_string_array(text: &str, max: usize) -> Vec<String> {
     let start = text.find('[');
     let end = text.rfind(']');
     let Some(start) = start else {
-        return fallback_queries(text, max);
+        return Vec::new();
     };
     let Some(end) = end.filter(|end| *end > start) else {
-        return fallback_queries(text, max);
+        return Vec::new();
     };
     // The reply may wrap the array in prose or a markdown fence; the slice
     // between the outermost brackets is the array itself. Parse it as JSON
     // instead of splitting on commas, which corrupts entries that contain
     // commas or escaped quotes.
-    let items: Vec<String> = serde_json::from_str::<Vec<String>>(&text[start..=end])
+    serde_json::from_str::<Vec<String>>(&text[start..=end])
         .unwrap_or_default()
         .into_iter()
-        .filter(|item| !item.is_empty())
+        .filter(|item| !item.trim().is_empty())
         .take(max)
-        .collect();
-    if items.is_empty() {
-        fallback_queries(text, max)
-    } else {
-        items
-    }
+        .collect()
 }
 
 /// No-LLM plan: derive a few query variants from the question itself.
@@ -306,17 +301,62 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_when_array_is_not_valid_json() {
+    fn rejects_invalid_json() {
         let items = parse_string_array("[rust async, tokio runtime]", 3);
-        assert!(!items.is_empty());
-        assert!(items[0].contains("[rust async, tokio runtime]"));
+        assert!(items.is_empty());
     }
 
     #[test]
-    fn falls_back_when_no_array() {
+    fn rejects_a_reply_without_an_array() {
         let items = parse_string_array("just some prose", 3);
-        assert!(!items.is_empty());
-        assert!(items[0].contains("just some prose"));
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_plans_fall_back_to_the_original_question() {
+        use crate::settings::Settings;
+        use axum::{Json, Router, routing::post};
+
+        for reply in [
+            "[rust async, tokio runtime]",
+            "just some prose",
+            "[]",
+            r#"["", "  "]"#,
+        ] {
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || async move {
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": reply}}]
+                    }))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut settings = Settings::defaults();
+            settings.engines.clear();
+            settings.search.local_index_path.clear();
+            settings.search.wikipedia_index_path.clear();
+            settings.research.enabled = true;
+            settings.research.base_url = base_url;
+            settings.research.api_key = "test-key".into();
+            let searcher = Searcher::new(settings).unwrap();
+
+            let report = searcher.research("Rust ownership", 3, 5).await;
+            server.abort();
+
+            assert_eq!(
+                report.queries,
+                [
+                    "Rust ownership",
+                    "Rust ownership overview",
+                    "Rust ownership best practices"
+                ],
+                "{reply}"
+            );
+            assert_eq!(report.report.as_deref(), Some(reply));
+        }
     }
 
     #[test]
