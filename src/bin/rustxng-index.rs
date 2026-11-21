@@ -2,11 +2,16 @@
 //!
 //!   rustxng-index crawl --seeds seeds.txt --out ./index-data --max-pages 2000
 //!       [--sitemaps] [--within-seed-path] [--skip-indexed] [--max-per-host N] [--workers N]
+//!       [--since RFC3339] [--prune-missing [--scope PREFIX] [--dry-run]]
 //!   rustxng-index search --index ./index-data "tokio runtime"
 //!   rustxng-index stats --index ./index-data
 //!
 //! Requests stay on the seed sites, obey robots and page directives, and share
 //! per-host pacing. Downloads, pending URLs, and sitemap traversal are bounded.
+//!
+//! A recrawl replaces the documents it visits and keeps the rest. The deletion
+//! pass (`--prune-missing`) and the freshness cutoff (`--since`) are opt-in and
+//! only run after a complete pass over the scope.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -38,12 +43,52 @@ const DEFAULT_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest `Retry-After` we are willing to honour.
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
+fn usage() {
+    println!(
+        "usage: rustxng-index <crawl|search|stats> [options]
+
+crawl
+  --seeds FILE            seed URLs, one per line (required)
+  --out DIR, --index DIR  index directory (default index-data)
+  --max-pages N           stop after N pages (default 500)
+  --max-depth N           follow links N levels deep (default 2)
+  --max-per-host N        pages taken from one host (default 2000)
+  --max-queue N           pending URLs kept (default 10000)
+  --max-sitemaps N        sitemap documents read per origin (default 64)
+  --delay-ms N            pause between requests to one host (default 1000)
+  --workers N             download threads (default 4)
+  --contact TEXT          mail address or URL announced in the user agent
+  --sitemaps              also read the hosts' sitemaps
+  --within-seed-path      stay under the seeds' directories
+  --skip-indexed          do not download sitemap URLs the index already holds
+  --since RFC3339         refetch only documents indexed before this instant
+                          (needs --sitemaps)
+  --prune-missing         delete documents in scope that this run never visited
+  --scope PREFIX          URL prefix covered by --prune-missing (repeatable)
+  --dry-run               report what --prune-missing would delete
+
+search
+  --index DIR             index directory (default index-data)
+  --limit N               results to print (default 10)
+  QUERY...                words to look for
+
+stats
+  --index DIR             index directory (default index-data)
+
+--help                  show this text"
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first().cloned() else {
-        eprintln!("usage: rustxng-index <crawl|search|stats> [options]");
+        usage();
         std::process::exit(2);
     };
+    if matches!(command.as_str(), "--help" | "-h" | "help") {
+        usage();
+        return;
+    }
     let options = Options::parse(&args[1..]);
     let result = match command.as_str() {
         "crawl" => crawl(&options),
@@ -83,6 +128,15 @@ struct Options {
     contact: String,
     limit: usize,
     query: Vec<String>,
+    /// Delete documents in scope that this run never visited. Never the
+    /// default: a partial crawl makes absence look like a deletion.
+    prune_missing: bool,
+    /// Report what `--prune-missing` would delete without touching the index.
+    dry_run: bool,
+    /// URL prefixes the deletion pass covers instead of the seed scope.
+    scope: Vec<String>,
+    /// RFC 3339 instant: only documents indexed before it are refetched.
+    since: Option<String>,
 }
 
 impl Options {
@@ -103,6 +157,10 @@ impl Options {
             contact: String::new(),
             limit: 10,
             query: Vec::new(),
+            prune_missing: false,
+            dry_run: false,
+            scope: Vec::new(),
+            since: None,
         };
         let mut index = 0;
         while index < args.len() {
@@ -156,6 +214,14 @@ impl Options {
                 "--sitemaps" => options.use_sitemaps = true,
                 "--within-seed-path" => options.within_seed_path = true,
                 "--skip-indexed" => options.skip_indexed = true,
+                "--prune-missing" => options.prune_missing = true,
+                "--dry-run" => options.dry_run = true,
+                "--scope" => {
+                    if let Some(value) = next() {
+                        options.scope.push(value);
+                    }
+                }
+                "--since" => options.since = next(),
                 "--workers" => {
                     if let Some(value) = next().and_then(|v| v.parse::<usize>().ok()) {
                         options.workers = value.clamp(1, 32);
@@ -430,6 +496,9 @@ struct Crawl {
     /// URLs taken from sitemaps: the only ones `--skip-indexed` may skip,
     /// because their links are not needed to discover the rest of the site.
     from_sitemap: Mutex<HashSet<String>>,
+    /// Every URL this run claimed. A deletion pass compares this with the
+    /// index: a document it never saw was not visited, not necessarily gone.
+    seen: Mutex<HashSet<String>>,
     max_queue: usize,
 }
 
@@ -446,8 +515,17 @@ impl Crawl {
             counters: Counters::default(),
             scope: None,
             from_sitemap: Mutex::new(HashSet::new()),
+            seen: Mutex::new(HashSet::new()),
             max_queue: 10_000,
         }
+    }
+
+    /// Remember that this run visited `url`.
+    fn mark_seen(&self, url: &str) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(url.to_string());
     }
 
     /// Give back a per-host slot claimed for a page that was not fetched.
@@ -729,10 +807,50 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
     if options.max_pages == 0 {
         return Err("--max-pages must be positive".into());
     }
+    if options.dry_run && !options.prune_missing {
+        return Err("--dry-run needs --prune-missing".into());
+    }
+    if !options.scope.is_empty() && !options.prune_missing {
+        return Err("--scope only applies with --prune-missing".into());
+    }
+    if options.prune_missing && options.skip_indexed {
+        return Err(
+            "--prune-missing cannot be combined with --skip-indexed: skipped pages look missing"
+                .into(),
+        );
+    }
+    if options.prune_missing && options.since.is_some() {
+        return Err(
+            "--prune-missing cannot be combined with --since: documents that were not refetched look missing"
+                .into(),
+        );
+    }
+    for prefix in &options.scope {
+        let parsed = url::Url::parse(prefix)
+            .map_err(|error| format!("--scope is not a URL ({prefix}): {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!("--scope must be an HTTP(S) URL: {prefix}"));
+        }
+    }
+    let since = match options.since.as_deref() {
+        Some(text) => {
+            if !options.use_sitemaps {
+                return Err(
+                    "--since needs --sitemaps: only sitemap URLs are skipped, so link discovery keeps working"
+                        .into(),
+                );
+            }
+            let parsed = chrono::DateTime::parse_from_rfc3339(text)
+                .map_err(|error| format!("--since is not an RFC 3339 instant ({text}): {error}"))?;
+            Some(parsed.timestamp())
+        }
+        None => None,
+    };
     let seeds_path = options.seeds.as_ref().ok_or("crawl needs --seeds <file>")?;
     let seeds = std::fs::read_to_string(seeds_path)
         .map_err(|error| format!("read {seeds_path:?}: {error}"))?;
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut seed_urls: Vec<String> = Vec::new();
     for line in seeds.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -743,6 +861,7 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
             if !rustxng::fetch::is_fetchable(&parsed) {
                 return Err(format!("seed is not a public HTTP(S) URL: {url}"));
             }
+            seed_urls.push(url.clone());
             queue.push_back((url, 0));
         }
     }
@@ -796,10 +915,16 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
     let (sender, receiver) = std::sync::mpsc::sync_channel(options.workers);
     let max_depth = options.max_depth;
     let max_per_host = options.max_per_host;
-    // `--skip-indexed`: a resumed crawl does not download pages it already
-    // holds (their links are then not followed; sitemaps cover that).
+    // `--skip-indexed` and `--since`: a resumed crawl does not download pages
+    // it already holds or pages that are still fresh (their links are then not
+    // followed; sitemaps cover that).
+    let skip_indexed = options.skip_indexed;
+    let fresh_since = since;
     let known = if options.skip_indexed {
         Some(Arc::new(LocalIndex::open(&options.index)?))
+    } else if since.is_some() {
+        // A first run has no index yet: every page is fetched.
+        LocalIndex::open(&options.index).ok().map(Arc::new)
     } else {
         None
     };
@@ -823,14 +948,32 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
                     continue;
                 };
                 let _active = InFlight(&crawl.in_flight);
+                // Every claimed URL counts as visited, however the fetch ends:
+                // a deletion pass must never read a failure as a removal.
+                crawl.mark_seen(&url);
                 let listed = crawl
                     .from_sitemap
                     .lock()
                     .map(|listed| listed.contains(&url))
                     .unwrap_or(false);
-                if listed && known.as_ref().is_some_and(|index| index.has_url(&url)) {
-                    crawl.refund_host(&url);
-                    continue;
+                if listed {
+                    let remembered = known.as_ref().is_some_and(|index| {
+                        if skip_indexed {
+                            index.has_url(&url)
+                        } else {
+                            fresh_since.is_some_and(|since| {
+                                index
+                                    .indexed_at(&url)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|indexed_at| indexed_at as i64 >= since)
+                            })
+                        }
+                    });
+                    if remembered {
+                        crawl.refund_host(&url);
+                        continue;
+                    }
                 }
                 let outcome = fetch(&client, &url, depth, max_depth, &crawl, delay);
                 let update = match outcome {
@@ -863,6 +1006,7 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
     drop(sender);
 
     let mut indexed = 0;
+    let mut truncated = false;
     let writing = (|| -> Result<(), String> {
         let mut fingerprints = HashSet::new();
         let mut content_hashes = HashMap::new();
@@ -871,6 +1015,14 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
                 IndexUpdate::Page(mut page) => {
                     let mut aliases = std::mem::take(&mut page.aliases);
                     aliases.retain(|url| url != &page.url);
+                    // The index stores a page under its canonical address,
+                    // which a redirect or a canonical link can make different
+                    // from the requested one. The deletion pass compares this
+                    // set with the stored URLs, so both have to be in it.
+                    crawl.mark_seen(&page.url);
+                    for url in &aliases {
+                        crawl.mark_seen(url);
+                    }
                     (Some(page), aliases)
                 }
                 IndexUpdate::Remove(urls) => (None, urls),
@@ -909,6 +1061,7 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
                 let _ = std::io::stdout().flush();
             }
             if indexed >= options.max_pages {
+                truncated = true;
                 break;
             }
         }
@@ -925,6 +1078,27 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
     }
     writing?;
 
+    // Deletion sync. Only a complete pass over the scope may delete: a run
+    // that stopped at a limit leaves documents unvisited for a reason that is
+    // not a removal.
+    if options.prune_missing {
+        let counters = &crawl.counters;
+        let capped = truncated
+            || counters.queue_capped.load(Ordering::Relaxed) > 0
+            || counters.host_capped.load(Ordering::Relaxed) > 0;
+        if capped {
+            println!(
+                "prune skipped: this run stopped at a limit (--max-pages, --max-per-host or --max-queue), so unvisited documents are not deletions"
+            );
+        } else {
+            let seen = crawl
+                .seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            prune_missing(&index, options, &seed_urls, &seen)?;
+        }
+    }
+
     let counters = &crawl.counters;
     println!(
         "crawled {indexed} pages, index now has {} documents",
@@ -940,6 +1114,63 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
         counters.failed.load(Ordering::Relaxed),
         counters.backoffs.load(Ordering::Relaxed),
     );
+    Ok(())
+}
+
+/// Whether the deletion pass covers a URL: one of the `--scope` prefixes, or
+/// else the hosts of the seeds (their directories with `--within-seed-path`).
+fn prune_covers(url: &str, options: &Options, seeds: &[String]) -> bool {
+    if !options.scope.is_empty() {
+        return options
+            .scope
+            .iter()
+            .any(|prefix| url.starts_with(prefix.as_str()));
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    seeds.iter().any(|seed| {
+        let Ok(origin) = url::Url::parse(seed) else {
+            return false;
+        };
+        same_site(&origin, &parsed)
+            && (!options.within_seed_path
+                || parsed.path().starts_with(seed_directory(seed).as_str()))
+    })
+}
+
+/// Delete the documents in scope that this run never visited, printing each
+/// URL it removes. With `--dry-run` the list is printed and nothing changes.
+fn prune_missing(
+    index: &LocalIndex,
+    options: &Options,
+    seeds: &[String],
+    seen: &HashSet<String>,
+) -> Result<(), String> {
+    let mut missing: Vec<String> = index
+        .urls()?
+        .into_iter()
+        .filter(|url| prune_covers(url, options, seeds) && !seen.contains(url))
+        .collect();
+    missing.sort();
+    if missing.is_empty() {
+        println!("prune: no documents missing");
+        return Ok(());
+    }
+    let total = missing.len();
+    if options.dry_run {
+        println!("would prune {total} documents not seen in this run (dry run):");
+        for url in &missing {
+            println!("  {url}");
+        }
+        return Ok(());
+    }
+    println!("pruned {total} documents not seen in this run:");
+    for url in &missing {
+        index.remove(url)?;
+        println!("  {url}");
+    }
+    index.commit()?;
     Ok(())
 }
 
@@ -1581,6 +1812,247 @@ mod tests {
         let hits = index.search("replacementvalue", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, server.url("/changed").as_str());
+    }
+
+    /// A crawl whose seeds are the example.test root.
+    fn crawl_options(directory: &tempfile::TempDir, seed: &str) -> Options {
+        let seeds = directory.path().join("seeds.txt");
+        std::fs::write(&seeds, seed).unwrap();
+        let mut options = Options::parse(&[]);
+        options.seeds = Some(seeds);
+        options.index = directory.path().join("index");
+        options.delay_ms = 0;
+        options.workers = 1;
+        options
+    }
+
+    #[test]
+    fn the_prune_scope_is_the_seed_host_and_scope_prefixes() {
+        let mut options = Options::parse(&[]);
+        let seeds = vec!["https://docs.example/3/".to_string()];
+        assert!(prune_covers("https://docs.example/3/x", &options, &seeds));
+        assert!(!prune_covers("https://other.example/3/x", &options, &seeds));
+        options.within_seed_path = true;
+        assert!(!prune_covers(
+            "https://docs.example/ja/3/x",
+            &options,
+            &seeds
+        ));
+        options.scope = vec!["https://other.example/".into()];
+        assert!(prune_covers("https://other.example/x", &options, &seeds));
+        assert!(!prune_covers("https://docs.example/3/x", &options, &seeds));
+    }
+
+    #[test]
+    fn new_flags_are_validated_before_crawling() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = crawl_options(&directory, "https://example.test/");
+        let client = mock_client("127.0.0.1:9".parse().unwrap(), "");
+        options.dry_run = true;
+        let error = crawl_with_client(&options, client.clone()).unwrap_err();
+        assert!(error.contains("--dry-run needs --prune-missing"), "{error}");
+
+        options.dry_run = false;
+        options.prune_missing = true;
+        options.skip_indexed = true;
+        let error = crawl_with_client(&options, client.clone()).unwrap_err();
+        assert!(error.contains("--skip-indexed"), "{error}");
+
+        options.skip_indexed = false;
+        options.since = Some("2026-01-01T00:00:00Z".into());
+        let error = crawl_with_client(&options, client.clone()).unwrap_err();
+        assert!(error.contains("cannot be combined with --since"), "{error}");
+
+        options.prune_missing = false;
+        let error = crawl_with_client(&options, client.clone()).unwrap_err();
+        assert!(error.contains("--since needs --sitemaps"), "{error}");
+
+        options.use_sitemaps = true;
+        options.since = Some("yesterday".into());
+        let error = crawl_with_client(&options, client.clone()).unwrap_err();
+        assert!(error.contains("not an RFC 3339 instant"), "{error}");
+
+        options.since = None;
+        options.prune_missing = true;
+        options.scope = vec!["not a url".into()];
+        let error = crawl_with_client(&options, client).unwrap_err();
+        assert!(error.contains("--scope is not a URL"), "{error}");
+    }
+
+    #[test]
+    fn prune_missing_removes_documents_the_run_never_visited() {
+        let server = TestServer::new(|_, path, _| match path {
+            "/robots.txt" => reply(200, "", ""),
+            "/" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>Root</title><a href='/kept'>kept</a>",
+            ),
+            "/kept" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>Kept</title><p>keptvalue</p>",
+            ),
+            _ => panic!("unexpected request: {path}"),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = crawl_options(&directory, server.url("/").as_str());
+        options.prune_missing = true;
+        options.dry_run = true;
+        let gone = server.url("/gone").to_string();
+        {
+            let index = LocalIndex::open_for_write(&options.index).unwrap();
+            index
+                .add(&Page {
+                    url: &gone,
+                    title: "Gone",
+                    body: "gonevalue",
+                    lang: "en",
+                    snippet: "",
+                })
+                .unwrap();
+            index.commit().unwrap();
+        }
+        crawl_with_client(&options, server.client()).unwrap();
+        assert!(
+            LocalIndex::open(&options.index).unwrap().has_url(&gone),
+            "a dry run must not delete"
+        );
+
+        options.dry_run = false;
+        crawl_with_client(&options, server.client()).unwrap();
+        let index = LocalIndex::open(&options.index).unwrap();
+        assert!(!index.has_url(&gone));
+        assert!(index.has_url(server.url("/").as_str()));
+        assert!(index.has_url(server.url("/kept").as_str()));
+    }
+
+    #[test]
+    fn prune_keeps_documents_whose_address_was_redirected() {
+        let server = TestServer::new(|_, path, _| match path {
+            "/robots.txt" => reply(200, "", ""),
+            "/old" => reply(302, "Location: /new\r\n", ""),
+            "/new" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>New</title><p>newvalue</p>",
+            ),
+            _ => panic!("unexpected request: {path}"),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = crawl_options(&directory, server.url("/old").as_str());
+        options.prune_missing = true;
+        crawl_with_client(&options, server.client()).unwrap();
+        // The document is stored under /new but was requested as /old; the
+        // deletion pass must not read that as "not visited".
+        let index = LocalIndex::open(&options.index).unwrap();
+        assert_eq!(index.document_count(), 1);
+        assert!(index.has_url(server.url("/new").as_str()));
+    }
+
+    #[test]
+    fn a_truncated_run_never_prunes() {
+        let server = TestServer::new(|_, path, _| match path {
+            "/robots.txt" => reply(200, "", ""),
+            "/" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>Root</title><a href='/kept'>kept</a>",
+            ),
+            "/kept" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>Kept</title><p>keptvalue</p>",
+            ),
+            _ => panic!("unexpected request: {path}"),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = crawl_options(&directory, server.url("/").as_str());
+        options.prune_missing = true;
+        options.max_pages = 1;
+        let gone = server.url("/gone").to_string();
+        {
+            let index = LocalIndex::open_for_write(&options.index).unwrap();
+            index
+                .add(&Page {
+                    url: &gone,
+                    title: "Gone",
+                    body: "gonevalue",
+                    lang: "en",
+                    snippet: "",
+                })
+                .unwrap();
+            index.commit().unwrap();
+        }
+        crawl_with_client(&options, server.client()).unwrap();
+        assert!(
+            LocalIndex::open(&options.index).unwrap().has_url(&gone),
+            "a run stopped at --max-pages must not delete"
+        );
+    }
+
+    #[test]
+    fn since_skips_documents_that_are_already_fresh() {
+        let server = TestServer::new(|_, path, base| match path {
+            "/robots.txt" => reply(200, "", &format!("Sitemap: {base}/sitemap.xml\n")),
+            "/sitemap.xml" => {
+                let mut xml = String::from("<urlset>");
+                for page in ["/a", "/b"] {
+                    xml.push_str(&format!("<url><loc>{base}{page}</loc></url>"));
+                }
+                xml.push_str("</urlset>");
+                reply(200, "", &xml)
+            }
+            "/" => reply(200, "Content-Type: text/html\r\n", "<title>Root</title>"),
+            "/a" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>A</title><p>avalue</p>",
+            ),
+            "/b" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>B</title><p>bvalue</p>",
+            ),
+            _ => panic!("unexpected request: {path}"),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = crawl_options(&directory, server.url("/").as_str());
+        options.use_sitemaps = true;
+        options.max_pages = 10;
+        crawl_with_client(&options, server.client()).unwrap();
+        let index = LocalIndex::open(&options.index).unwrap();
+        assert!(index.has_url(server.url("/a").as_str()));
+        assert!(index.has_url(server.url("/b").as_str()));
+        drop(index);
+
+        // Fresh: indexed after the cutoff, so neither page is fetched again.
+        options.since = Some(
+            (chrono::Utc::now() - chrono::Duration::seconds(3600))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        let before = server.paths().len();
+        crawl_with_client(&options, server.client()).unwrap();
+        let fresh: Vec<String> = server.paths()[before..]
+            .iter()
+            .filter(|path| path.as_str() == "/a" || path.as_str() == "/b")
+            .cloned()
+            .collect();
+        assert!(fresh.is_empty(), "fresh pages were refetched: {fresh:?}");
+
+        // Stale: indexed before the cutoff, so both pages are refetched.
+        options.since = Some(
+            (chrono::Utc::now() + chrono::Duration::seconds(3600))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        let before = server.paths().len();
+        crawl_with_client(&options, server.client()).unwrap();
+        let stale: Vec<String> = server.paths()[before..]
+            .iter()
+            .filter(|path| path.as_str() == "/a" || path.as_str() == "/b")
+            .cloned()
+            .collect();
+        assert_eq!(stale, ["/a", "/b"]);
     }
 
     #[test]
