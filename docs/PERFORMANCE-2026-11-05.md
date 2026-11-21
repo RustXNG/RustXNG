@@ -98,7 +98,7 @@ python3 tools/eval_quality.py --base http://127.0.0.1:29835 \
 
 ## 2026-11-08 の再測定
 
-v0.30.0（`51bd480`）に [PR #128](https://github.com/sahenjp/RustXNG/pull/128) のraw content改善を
+v0.30.0（`51bd480`）に [PR #128](https://github.com/RustXNG/RustXNG/pull/128) のraw content改善を
 加えたブランチで、同一の100問をStandard設定で再実行しました。質問・正解URL・待機（1.1秒）は
 変更していません。ローカルの文書索引とWikipedia索引も同じものを使用しました。
 

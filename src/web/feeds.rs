@@ -4,7 +4,7 @@
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 
-use super::AppState;
+use super::{AppState, SuspendedEngineView};
 use crate::aggregator::SearchResponse;
 use crate::engine::util::encode;
 
@@ -12,9 +12,15 @@ use crate::engine::util::encode;
 /// The exact JSON document of upstream's `get_json_response`.
 ///
 /// Only upstream's fields are emitted, which is what a SearXNG client expects.
+/// `suspended_engines` is a rustxng extra (reason and remaining time of a
+/// suspended engine) and is left out while the list is empty, so an instance
+/// without suspensions keeps the upstream shape.
 /// The richer response (timings, counters, engine data) is served with
 /// `format=json&full=1` through [`json_response_full`].
-pub fn upstream_json(response: &SearchResponse) -> serde_json::Value {
+pub fn upstream_json(
+    response: &SearchResponse,
+    suspended: &[SuspendedEngineView],
+) -> serde_json::Value {
     let results: Vec<serde_json::Value> = response
         .results
         .iter()
@@ -79,7 +85,7 @@ pub fn upstream_json(response: &SearchResponse) -> serde_json::Value {
         .collect();
     unresponsive.sort();
 
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "query": response.query,
         "results": results,
         "answers": answers,
@@ -87,13 +93,20 @@ pub fn upstream_json(response: &SearchResponse) -> serde_json::Value {
         "infoboxes": response.infoboxes,
         "suggestions": response.suggestions,
         "unresponsive_engines": unresponsive,
-    })
+    });
+    if !suspended.is_empty() {
+        value["suspended_engines"] = serde_json::json!(suspended);
+    }
+    value
 }
 
 /// The rich JSON response (upstream fields plus rustxng extras) for
 /// `format=json&full=1`.
-pub fn json_response_full(response: &SearchResponse) -> serde_json::Value {
-    let mut value = upstream_json(response);
+pub fn json_response_full(
+    response: &SearchResponse,
+    suspended: &[SuspendedEngineView],
+) -> serde_json::Value {
+    let mut value = upstream_json(response, suspended);
     if let Some(object) = value.as_object_mut() {
         object.insert("search_query".into(), response.search_query.clone().into());
         object.insert(
@@ -300,12 +313,15 @@ mod tests {
         result.raw_content = Some("shortened page".into());
         result.raw_content_truncated = Some(true);
         response.results.push(result);
-        for value in [upstream_json(&response), json_response_full(&response)] {
+        for value in [
+            upstream_json(&response, &[]),
+            json_response_full(&response, &[]),
+        ] {
             assert_eq!(value["results"][0]["raw_content_truncated"], true);
         }
         response.results[0].raw_content = None;
         assert!(
-            upstream_json(&response)["results"][0]
+            upstream_json(&response, &[])["results"][0]
                 .get("raw_content_truncated")
                 .is_none()
         );
@@ -324,7 +340,7 @@ mod tests {
             "https://example.com/a",
             "A",
         ));
-        let value = upstream_json(&response);
+        let value = upstream_json(&response, &[]);
         let mut keys: Vec<&String> = value.as_object().unwrap().keys().collect();
         keys.sort();
         assert_eq!(
@@ -343,6 +359,37 @@ mod tests {
     }
 
     #[test]
+    fn suspended_engines_are_reported_only_when_present() {
+        use crate::aggregator::SearchResponse;
+        use crate::engine::EngineRegistry;
+        use crate::query::Query;
+        use crate::settings::Settings;
+        let registry = EngineRegistry::from_settings(&Settings::defaults()).unwrap();
+        let query = Query::parse("rust", &registry, &[]);
+        let response = SearchResponse::new(&query);
+
+        let plain = upstream_json(&response, &[]);
+        assert!(
+            plain.get("suspended_engines").is_none(),
+            "no suspensions keeps the upstream shape"
+        );
+
+        let suspended = vec![SuspendedEngineView {
+            engine: "duckduckgo".into(),
+            reason: "captcha".into(),
+            seconds_remaining: 42,
+        }];
+        for value in [
+            upstream_json(&response, &suspended),
+            json_response_full(&response, &suspended),
+        ] {
+            assert_eq!(value["suspended_engines"][0]["engine"], "duckduckgo");
+            assert_eq!(value["suspended_engines"][0]["reason"], "captcha");
+            assert_eq!(value["suspended_engines"][0]["seconds_remaining"], 42);
+        }
+    }
+
+    #[test]
     fn the_full_json_adds_the_counters() {
         use crate::aggregator::SearchResponse;
         use crate::engine::EngineRegistry;
@@ -351,7 +398,7 @@ mod tests {
         let registry = EngineRegistry::from_settings(&Settings::defaults()).unwrap();
         let query = Query::parse("rust", &registry, &[]);
         let response = SearchResponse::new(&query);
-        let value = json_response_full(&response);
+        let value = json_response_full(&response, &[]);
         assert!(value.get("timings").is_some());
         assert!(value.get("number_of_results").is_some());
     }

@@ -331,15 +331,18 @@ async fn run_search(
 
     match format.as_str() {
         "json" => {
+            // Suspensions live in the engine runtime state, not in the
+            // response, so the views are derived from the searcher.
+            let suspended = super::suspended_engine_views(state.searcher.as_ref());
             let full = params
                 .full
                 .as_deref()
                 .map(|value| matches!(value, "1" | "true" | "on" | "yes"))
                 .unwrap_or(false);
             if full {
-                axum::Json(super::feeds::json_response_full(&response)).into_response()
+                axum::Json(super::feeds::json_response_full(&response, &suspended)).into_response()
             } else {
-                axum::Json(super::feeds::upstream_json(&response)).into_response()
+                axum::Json(super::feeds::upstream_json(&response, &suspended)).into_response()
             }
         }
         "csv" => super::feeds::csv_response(&response),
@@ -457,6 +460,7 @@ fn results_page(
             )
         })
         .collect();
+    let suspended_engines = super::suspended_engine_views(state.searcher.as_ref());
 
     render(ResultsTemplate {
         instance_name: state.settings().general.instance_name.clone(),
@@ -474,6 +478,8 @@ fn results_page(
         infoboxes,
         has_unresponsive: !unresponsive.is_empty(),
         unresponsive_engines: unresponsive,
+        has_suspended: !suspended_engines.is_empty(),
+        suspended_engines,
         number_of_results: response.number_of_results,
         pageno,
         has_prev: prev_url.is_some(),
@@ -627,11 +633,11 @@ pub async fn config(State(state): State<AppState>) -> Response {
         .collect();
     let brand = serde_json::json!({
         "CONTACT_URL": settings.general.contact_url.clone(),
-        "DOCS_URL": "https://github.com/sahenjp/RustXNG/tree/main/docs",
-        "GIT_URL": "https://github.com/sahenjp/RustXNG",
+        "DOCS_URL": "https://github.com/RustXNG/RustXNG/tree/main/docs",
+        "GIT_URL": "https://github.com/RustXNG/RustXNG",
         "GIT_BRANCH": "main",
-        "ISSUE_URL": "https://github.com/sahenjp/RustXNG/issues",
-        "NEW_ISSUE_URL": "https://github.com/sahenjp/RustXNG/issues/new/choose",
+        "ISSUE_URL": "https://github.com/RustXNG/RustXNG/issues",
+        "NEW_ISSUE_URL": "https://github.com/RustXNG/RustXNG/issues/new/choose",
         "PRIVACYPOLICY_URL": settings.general.privacypolicy_url.clone(),
         "DONATION_URL": settings.general.donation_url.clone(),
     });
@@ -1379,14 +1385,33 @@ fn decode_form(value: &str) -> String {
         .to_string()
 }
 
-/// Keep the helper used by the preferences template (it renders lists).
-pub fn _join_list(values: &[String]) -> String {
-    join_list(values)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregator::Searcher;
+    use crate::settings::Settings;
+
+    #[test]
+    fn a_blocked_limiter_verdict_is_a_429_with_retry_after() {
+        let state = AppState::new(Searcher::new(Settings::defaults()).expect("searcher"));
+        let response = limiter_response(
+            &state,
+            "json",
+            LimiterVerdict::Blocked {
+                retry_after: 42,
+                message: "too many requests in API_WINDOW (4)".into(),
+            },
+        )
+        .expect("a blocked verdict renders a response");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("42")
+        );
+    }
 
     #[test]
     fn form_bodies_keep_repeated_keys() {

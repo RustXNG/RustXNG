@@ -2,7 +2,7 @@
 
 ## Private reporting
 
-Please report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/sahenjp/RustXNG/security/advisories/new),
+Please report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/RustXNG/RustXNG/security/advisories/new),
 not a public Issue or Discussion. This feature is enabled for the repository.
 Include the affected version, configuration, minimal reproduction and expected impact, without real credentials or private data.
 The owner coordinates investigation and disclosure; no response-time guarantee is currently offered.
@@ -22,7 +22,8 @@ An authenticated proxy is not automatically a safe resolver for untrusted destin
 
 Page reads (MCP `read_page`, search raw content and research), images and favicons
 use a direct-only client with URL checks on every redirect. DNS is resolved once
-per connection; an empty answer or any non-global address rejects the entire answer.
+per connection; non-global addresses are dropped and only the global ones reach
+the connector, and an answer with no global address at all is refused.
 The connector uses those checked addresses. Private configured engine endpoints
 do not grant exceptions to page or media fetching. IPv4, IPv6, mapped addresses,
 NAT64 and 6to4 destinations are checked. Proxies, including environment proxies,
@@ -33,7 +34,8 @@ application checks cannot control local routing or custom address translation.
 Engine requests use a separate client because an engine may legitimately be
 self-hosted. It applies the same per-hop rule: a redirect may stay on the
 engine's own origin (same scheme, host and port), and every other target has to
-be a public http(s) URL whose single DNS answer contains only global addresses.
+be a public http(s) URL whose DNS answer contains at least one global address;
+non-global addresses in that answer are not connected to.
 The host names of configured engine endpoints are the only exemption from that
 address rule, so a LAN engine keeps working while a redirect target does not
 inherit the exemption. Decoded engine response bodies are cut while streaming at
@@ -76,12 +78,12 @@ This is a dated snapshot, not a claim about the latest advisory database or expl
 The [2026-11-03 audit comparison](docs/audit/2026-11-03/dependencies-summary.json) records an update to
 ctutils 0.4.4 for RUSTSEC-2026-0385. The vulnerability section is then empty, but two `lru 0.12.5`
 unsoundness advisories through MySQL and three maintenance warnings remain. They are tracked in
-[issue #64](https://github.com/sahenjp/RustXNG/issues/64); this is not an advisory-free dependency tree.
+[issue #64](https://github.com/RustXNG/RustXNG/issues/64); this is not an advisory-free dependency tree.
 
 The [subsequent dependency update](docs/DEPENDENCY-SECURITY-2026-11-03.md) removes
 the affected `lru` version and updates `serde_with` for GHSA-7gcf-g7xr-8hxj.
 That dated RustSec scan found no vulnerabilities or unsoundness findings, but **at that time** three
-maintenance warnings remained under [issue #79](https://github.com/sahenjp/RustXNG/issues/79). Those three packages have since been removed from the current lockfile.
+maintenance warnings remained under [issue #79](https://github.com/RustXNG/RustXNG/issues/79). Those three packages have since been removed from the current lockfile.
 
 Updates require review of actual usage, a locked dependency check, tests and platform/MSRV verification.
 Do not silently suppress a security advisory or present a clean normal CI run as a security audit.

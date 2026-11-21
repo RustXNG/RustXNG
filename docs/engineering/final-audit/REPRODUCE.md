@@ -1,7 +1,7 @@
 # REPRODUCE — 検証手順
 
 ```bash
-git clone https://github.com/sahenjp/RustXNG.git
+git clone https://github.com/RustXNG/RustXNG.git
 cd RustXNG
 git checkout f7639ce
 # 本セッションの変更を適用した作業ツリー（未コミット）を使う

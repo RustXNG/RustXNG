@@ -19,15 +19,9 @@ pub const SOCIAL_MEDIA: &str = "social media";
 pub const REPOSITORIES: &str = "repositories";
 pub const PACKAGES: &str = "packages";
 pub const BLOGS: &str = "blogs";
-pub const APPS: &str = "apps";
 pub const QA: &str = "q&a";
-pub const DICTIONARIES: &str = "dictionaries";
-pub const SHOPPING: &str = "shopping";
-pub const TRANSLATE: &str = "translate";
 pub const SCIENTIFIC_PUBLICATIONS: &str = "scientific publications";
-pub const CARGO: &str = "cargo";
 pub const CODE: &str = "code";
-pub const IMAGES_AND_VIDEOS: &str = "images and videos";
 
 /// Categories rendered as tabs in the UI (SearXNG `categories_as_tabs`).
 pub static TABS: &[&str] = &[
@@ -54,12 +48,4 @@ pub fn normalize(value: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Map any category onto the tab it belongs to, or `None` when it is not a tab.
-pub fn tab_of(category: &str) -> Option<&'static str> {
-    let normalized = normalize(category);
-    TABS.iter()
-        .copied()
-        .find(|tab| normalize(tab) == normalized)
 }

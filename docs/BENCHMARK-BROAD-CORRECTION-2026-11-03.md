@@ -1,6 +1,6 @@
 # Broad/fresh target-domain scoring correction — 2026-11-03
 
-PR [#81](https://github.com/sahenjp/RustXNG/pull/81) attaches each case's target domains before calculating its metrics.
+PR [#81](https://github.com/RustXNG/RustXNG/pull/81) attaches each case's target domains before calculating its metrics.
 Previously the observation retained the targets, but the scorer saw an empty list and stored zero coverage.
 
 The [additive correction record](../bench/rescore-broad-2026-11-03.json) records the original observation-file SHA-256,

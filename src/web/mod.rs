@@ -212,6 +212,15 @@ pub struct CategoryView {
     pub selected: bool,
 }
 
+/// An engine that is suspended right now, for the result page and JSON API.
+#[derive(Debug, Clone, Serialize)]
+pub struct SuspendedEngineView {
+    pub engine: String,
+    pub reason: String,
+    /// Whole seconds left, rounded up, so a suspended engine never reads 0.
+    pub seconds_remaining: u64,
+}
+
 /// A result prepared for the templates (no method calls in the templates).
 #[derive(Debug, Clone, Serialize)]
 pub struct ResultView {
@@ -330,6 +339,9 @@ pub struct ResultsTemplate {
     pub suggestions: Vec<String>,
     pub infoboxes: Vec<InfoboxView>,
     pub unresponsive_engines: Vec<String>,
+    /// Engines resting after a block or rate limit; empty when none are.
+    pub suspended_engines: Vec<SuspendedEngineView>,
+    pub has_suspended: bool,
     pub number_of_results: u64,
     pub pageno: u32,
     pub prev_url: String,
@@ -467,6 +479,26 @@ pub fn engine_views(searcher: &Searcher) -> Vec<EngineView> {
             safesearch: engine.safesearch_support(),
             language_support: engine.language_support(),
             enabled: true,
+        })
+        .collect()
+}
+
+/// Engines that are suspended at this moment, with reason and remaining time.
+///
+/// Suspensions live in the per-engine runtime state, not in the search
+/// response, so callers derive the list from the searcher when they render.
+pub fn suspended_engine_views(searcher: &Searcher) -> Vec<SuspendedEngineView> {
+    searcher
+        .states
+        .snapshot()
+        .into_iter()
+        .filter(|state| state.suspended)
+        .map(|state| SuspendedEngineView {
+            engine: state.engine,
+            reason: state
+                .suspension_reason
+                .unwrap_or_else(|| "suspended".to_string()),
+            seconds_remaining: state.suspended_for.ceil() as u64,
         })
         .collect()
 }

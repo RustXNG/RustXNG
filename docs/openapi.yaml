@@ -52,6 +52,17 @@ components:
         unresponsive_engines:
           type: array
           items: { type: array, items: { type: string } }
+        suspended_engines:
+          type: array
+          description: 休止中エンジンの理由と残り秒数（この実装の拡張）。空なら省略される。
+          items: { $ref: '#/components/schemas/SuspendedEngine' }
+    SuspendedEngine:
+      type: object
+      required: [engine, reason, seconds_remaining]
+      properties:
+        engine: { type: string }
+        reason: { type: string }
+        seconds_remaining: { type: integer, minimum: 0, description: 切り上げた残り秒数 }
     Readiness:
       type: object
       required: [ready, engines, local_index, reasons]

@@ -42,7 +42,7 @@
 
 | 項目 | 値 |
 | --- | --- |
-| リポジトリ | https://github.com/sahenjp/RustXNG |
+| リポジトリ | https://github.com/RustXNG/RustXNG |
 | 基点コミット（baseline） | `f7639cede00634a48db3261709bc359752f109eb`（v0.31.2、main） |
 | 候補（candidate） | 基点コミット上の**未コミット作業ツリー**（candidate のコミット SHA は存在しない） |
 | ブランチ | `main`（`origin/main` と一致） |

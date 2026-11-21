@@ -160,17 +160,41 @@ impl Resolve for SystemResolver {
     }
 }
 
-/// Resolve once, reject the entire answer if any address is non-global, and
-/// pass those exact checked addresses to the connector (no second lookup).
+/// Resolve once, keep only the global addresses from the answer, and pass
+/// those exact checked addresses to the connector (no second lookup).
+///
+/// Split-horizon DNS and carrier-grade NAT commonly mix a public address with
+/// a private or shared one for the same name. Rejecting the whole answer made
+/// such names unreachable, so non-global entries are dropped instead; the set
+/// that is connected to is still fully checked, and an answer with no global
+/// address at all is refused.
 struct PublicResolver(Arc<dyn Resolve>);
 
 impl Resolve for PublicResolver {
     fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
         let answer = self.0.resolve(name);
         Box::pin(async move {
             let addresses: Vec<SocketAddr> = answer.await?.collect();
-            if addresses.is_empty() || addresses.iter().any(|a| !is_global(a.ip())) {
-                return Err("DNS answer contains no addresses or a non-public address".into());
+            let total = addresses.len();
+            let addresses: Vec<SocketAddr> = addresses
+                .into_iter()
+                .filter(|address| is_global(address.ip()))
+                .collect();
+            let dropped = total - addresses.len();
+            if dropped > 0 {
+                tracing::warn!(
+                    host = %host,
+                    dropped,
+                    kept = addresses.len(),
+                    "ignoring non-public DNS answers"
+                );
+            }
+            if addresses.is_empty() {
+                return Err(format!(
+                    "DNS answer for {host} contains no public address ({total} address(es))"
+                )
+                .into());
             }
             Ok(Box::new(addresses.into_iter()) as Addrs)
         })
@@ -183,7 +207,8 @@ impl Resolve for PublicResolver {
 /// A search engine endpoint is trusted configuration: an operator may point it
 /// at a service on their own network, so those names are exempt from the
 /// global-address rule. Every other name, including a redirect target, is
-/// still resolved once and rejected when any answer is non-global.
+/// still resolved once and only its global addresses are connected to; an
+/// answer with no global address is rejected.
 pub(crate) fn validated_resolver(allow: Vec<String>) -> Arc<dyn Resolve> {
     let allow: BTreeSet<String> = allow
         .iter()
@@ -1038,7 +1063,7 @@ mod tests {
             .await
             .err()
             .expect("localhost must not resolve");
-        assert!(error.to_string().contains("non-public address"), "{error}");
+        assert!(error.to_string().contains("no public address"), "{error}");
     }
 
     struct Answers(Mutex<VecDeque<Vec<SocketAddr>>>);
@@ -1074,39 +1099,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_answers_are_checked_as_a_whole_and_never_resolved_twice() {
+    async fn dns_answers_with_private_addresses_keep_only_the_global_ones() {
         let public: SocketAddr = "8.8.8.8:80".parse().unwrap();
-        for unsafe_answer in [
-            vec![],
+        let public_v6: SocketAddr = "[2001:4860:4860::8888]:443".parse().unwrap();
+        let private: SocketAddr = "100.64.0.1:80".parse().unwrap();
+        let inner = Arc::new(Answers(Mutex::new(VecDeque::from([vec![
+            private,
+            public,
+            "[fd00::1]:80".parse().unwrap(),
+            "[::ffff:127.0.0.1]:80".parse().unwrap(),
+            public_v6,
+        ]]))));
+        let resolver = PublicResolver(inner.clone());
+        let checked: Vec<_> = resolver
+            .resolve("example.test".parse().unwrap())
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(checked, [public, public_v6]);
+        assert!(
+            inner.0.lock().unwrap().is_empty(),
+            "one lookup per connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_answers_without_a_global_address_are_refused() {
+        for answer in [
+            Vec::<SocketAddr>::new(),
+            vec!["100.64.0.1:80".parse().unwrap()],
             vec!["127.0.0.1:80".parse().unwrap()],
-            vec![public, "127.0.0.1:80".parse().unwrap()],
-            vec!["[fd00::1]:80".parse().unwrap(), public],
+            vec!["[fd00::1]:80".parse().unwrap()],
             vec!["[::ffff:127.0.0.1]:80".parse().unwrap()],
             vec!["[64:ff9b::a9fe:a9fe]:80".parse().unwrap()],
         ] {
-            let inner = Arc::new(Answers(Mutex::new(VecDeque::from([
-                vec![public],
-                unsafe_answer,
-            ]))));
-            let resolver = PublicResolver(inner.clone());
-            let checked: Vec<_> = resolver
+            let resolver = PublicResolver(Arc::new(Answers(Mutex::new(VecDeque::from([answer])))));
+            let error = resolver
                 .resolve("example.test".parse().unwrap())
                 .await
-                .unwrap()
-                .collect();
-            assert_eq!(checked, [public]);
-            assert_eq!(
-                inner.0.lock().unwrap().len(),
-                1,
-                "one lookup per connection"
-            );
-            assert!(
-                resolver
-                    .resolve("example.test".parse().unwrap())
-                    .await
-                    .is_err()
-            );
-            assert!(inner.0.lock().unwrap().is_empty());
+                .err()
+                .expect("an answer without a public address must fail");
+            assert!(error.to_string().contains("no public address"), "{error}");
         }
     }
 }

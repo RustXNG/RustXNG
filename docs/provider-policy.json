@@ -565,7 +565,13 @@
       ],
       "access_scope": "public_instance_best_effort",
       "review_scope": "Documented search/metadata retrieval and bounded operational caching; operator quotas, content licences and deployment-specific restrictions remain conditions. No blanket storage, commercial-reuse or training licence.",
-      "source_sha256": "17189d344eabbe54df020336d8d715c973cad4aa8e53210333efa51ccd784577"
+      "source_sha256": "c1ff66c52b9ece8e96d334b9a16cedd6eacdf494b4b987cbecdf006be43551d5",
+      "review_log": [
+        {
+          "date": "2026-11-21",
+          "change": "User-Agent contact URL moved to the current repository owner; no endpoint or use-condition change."
+        }
+      ]
     },
     "openverse": {
       "request_url": "https://api.openverse.org/v1/images/",

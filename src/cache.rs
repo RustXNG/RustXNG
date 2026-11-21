@@ -297,10 +297,6 @@ impl Cache {
         }
     }
 
-    pub fn is_valkey(&self) -> bool {
-        matches!(self.backend, CacheBackend::Valkey(_))
-    }
-
     /// Coordinate cache misses without serializing unrelated requests. Weak
     /// entries do not keep completed requests alive; prune them on the next miss.
     /// Dropping a cancelled fetch also releases its lock for the next caller.
