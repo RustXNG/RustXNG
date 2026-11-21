@@ -34,6 +34,7 @@ pub mod diagnostics;
 pub mod engine;
 pub mod engines;
 pub mod external_bangs;
+pub mod extract;
 pub mod fetch;
 pub mod locales;
 pub mod localindex;

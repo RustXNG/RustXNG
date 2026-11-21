@@ -4,11 +4,13 @@
 //! `/autocompleter`, `/config`, `/preferences`, `/stats`, `/stats/errors`,
 //! `/about`, `/opensearch.xml`, `/healthz`, `/robots.txt` and `/static/*`.
 
+pub mod extract_api;
 pub mod favicons;
 pub mod feeds;
 pub mod handlers;
 pub mod image_proxy;
 pub mod limiter;
+pub mod mcp_http;
 pub mod preferences;
 #[cfg(test)]
 mod ssrf_tests;
@@ -73,7 +75,15 @@ const MAX_REQUEST_BODY: usize = 64 * 1024;
 
 /// The router of the instance.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mcp = if state.searcher.settings.mcp.http {
+        Some(mcp_http::router(
+            state.searcher.clone(),
+            state.searcher.settings.mcp.allowed_hosts.clone(),
+        ))
+    } else {
+        None
+    };
+    let router = Router::new()
         .route("/", get(handlers::index))
         .route(
             "/search",
@@ -91,6 +101,8 @@ pub fn router(state: AppState) -> Router {
         .route("/image_proxy", get(image_proxy::handler))
         .route("/favicon_proxy", get(favicons::handler))
         .route("/research", get(handlers::research))
+        .route("/map", get(extract_api::map))
+        .route("/extract", get(extract_api::extract))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/about", get(handlers::about))
@@ -123,7 +135,13 @@ pub fn router(state: AppState) -> Router {
                 }
             }
         }))
-        .with_state(state)
+        .with_state(state);
+    // The MCP endpoint carries its own body limit and session state, so it is
+    // merged after the shared layers instead of inheriting them.
+    match mcp {
+        Some(mcp) => router.merge(mcp),
+        None => router,
+    }
 }
 
 /// Rewrite axum own rejections in the format the caller asked for.

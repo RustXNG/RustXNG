@@ -146,6 +146,48 @@ paths:
               schema: { type: array, items: { type: string } }
         '429':
           description: limiter
+  /map:
+    get:
+      summary: サイトの URL 一覧（上流にない拡張）
+      description: |
+        robots.txt の Sitemap 宣言 → sitemap index → シードページのリンクの順に発見する。
+        URL は正規化し、シードの origin に限定して重複を除く。取得は本文取得と同じ検証済みリーダー
+        （非公開アドレス拒否・robots.txt 遵守）を使い、limiter の対象。
+      parameters:
+        - { name: url, in: query, required: true, schema: { type: string }, description: 起点 URL（絶対 http(s)） }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 5000 }, description: 返す URL の上限（既定 5000） }
+      responses:
+        '200':
+          description: 発見した URL
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MapReport' }
+        '400':
+          description: url 欠落・不正
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { description: limiter }
+        '502': { description: 取得失敗（robots.txt / sitemap / シードページ） }
+  /extract:
+    get:
+      summary: ページからの構造化抽出（上流にない拡張）
+      description: |
+        JSON-LD → 定義リスト → 表の順に試し、最初に得られた方式だけを返す（同じデータを重複して返さない）。
+        各レコードは由来（source と path）を持つ。値はページにあるものだけで、推測はしない。
+      parameters:
+        - { name: url, in: query, required: true, schema: { type: string }, description: 対象 URL（絶対 http(s)） }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 }, description: 返すレコードの上限（既定 200） }
+      responses:
+        '200':
+          description: 抽出したレコード
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExtractReport' }
+        '400':
+          description: url 欠落・不正
+        '429': { description: limiter }
+        '502': { description: 取得失敗 }
   /research:
     get:
       summary: 深掘り調査（上流にない拡張）
