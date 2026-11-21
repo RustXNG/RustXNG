@@ -306,6 +306,37 @@ async fn bounded_index_search(
 /// index (the encyclopedia) is exempt: every hit is the same host.
 const MAX_PER_HOST: usize = 3;
 
+/// Largest lift a local-index hit's semantic score may add to its merge
+/// weight. Kept below 1.0: the merge is a position fusion, and the semantic
+/// score refines it instead of replacing it.
+const SEMANTIC_MERGE_LIFT: f64 = 0.5;
+
+/// Per-item merge weights for local-index hits.
+///
+/// The merge scores a source by position, so a semantic score that only
+/// reordered the hits would disappear from the number the caller sees. Each
+/// hit's weight is lifted by its cosine similarity instead, and never above
+/// the previous hit's weight. Non-increasing weights keep the blended order
+/// intact, because weight / position stays descending.
+fn semantic_weights(hits: &[crate::localindex::Hit]) -> Vec<f64> {
+    let mut weights = Vec::with_capacity(hits.len());
+    let mut previous = f64::INFINITY;
+    for hit in hits {
+        let weight = match hit.semantic {
+            Some(cosine) => {
+                // Only a positive similarity argues for the page; a cosine at
+                // or below zero is no evidence and takes no lift.
+                let similarity = f64::from(cosine).clamp(0.0, 1.0);
+                (1.0 + SEMANTIC_MERGE_LIFT * similarity).min(previous)
+            }
+            None => 1.0,
+        };
+        previous = weight;
+        weights.push(weight);
+    }
+    weights
+}
+
 /// Upper bound of the page bodies fetched for one search response.
 ///
 /// Each body is buffered in memory; the shipped default is 5.
@@ -858,9 +889,14 @@ impl Searcher {
             if !request.is_single_source() && !engines.is_empty() {
                 self.blend_index_hits(&request.query, &mut hits).await;
             }
-            let items: Vec<EngineItem> = hits
+            // The blended order is still only a position in the merge; the
+            // per-item weight is what makes the merged number carry the
+            // semantic score too.
+            let weights = semantic_weights(&hits);
+            let items: Vec<(f64, EngineItem)> = hits
                 .into_iter()
-                .map(|hit| {
+                .zip(weights)
+                .map(|(hit, weight)| {
                     let url = if source == "wikipedia_index" {
                         crate::official::article_of(&hit.url)
                             .map(|article| crate::official::article_iri(&article))
@@ -870,10 +906,10 @@ impl Searcher {
                     };
                     let mut result = SearchResult::new(url, hit.title);
                     result.content = hit.snippet;
-                    EngineItem::Result(result)
+                    (weight, EngineItem::Result(result))
                 })
                 .collect();
-            container.extend(source, 1.0, items);
+            container.extend_weighted(source, items);
         }
         if engines.is_empty() && container.main_results().is_empty() && !index_errors.is_empty() {
             response.error = Some(index_errors.join("; "));
@@ -2203,6 +2239,80 @@ mod orchestration_tests {
         );
         assert_eq!(response.engines, ["remote", "local_index"]);
         assert_eq!(response.results[0].url, "https://docs.example/semantic");
+    }
+
+    #[test]
+    fn semantic_weights_lift_the_number_without_reordering_the_source() {
+        let hit = |score: f32, semantic: Option<f32>| crate::localindex::Hit {
+            url: String::new(),
+            title: String::new(),
+            snippet: String::new(),
+            score,
+            semantic,
+        };
+        // Without an embeddings endpoint the weights are the old uniform 1.0,
+        // so BM25 order and the merged numbers do not move.
+        let plain = [hit(7.0, None), hit(5.0, None)];
+        assert_eq!(semantic_weights(&plain), vec![1.0, 1.0]);
+
+        // A positive cosine lifts the merged number.
+        let lifted = semantic_weights(&[hit(7.0, Some(1.0)), hit(5.0, Some(-1.0))]);
+        assert_eq!(lifted[0], 1.5);
+        assert_eq!(lifted[1], 1.0);
+
+        // A later hit with a higher cosine still never outweighs an earlier
+        // one: the blended order survives the position fusion.
+        let inverted = semantic_weights(&[hit(7.0, Some(-1.0)), hit(5.0, Some(1.0))]);
+        assert!(inverted[0] >= inverted[1]);
+        assert!(inverted[0] / 1.0 > inverted[1] / 2.0);
+    }
+
+    #[tokio::test]
+    async fn the_semantic_cosine_reaches_the_merged_score() {
+        let (address, _calls, server) = marker_embeddings("Semantic guide").await;
+        let remote = FakeEngine::build("remote", &["general"], 1, false);
+        let (_directory, mut searcher) = with_local_index(vec![remote]);
+        let index = Arc::clone(searcher.local_index.as_ref().unwrap());
+        index
+            .add(&crate::localindex::Page {
+                url: "https://docs.example/semantic",
+                title: "Semantic guide",
+                body: "The needle appears once here.",
+                lang: "en",
+                snippet: "",
+            })
+            .unwrap();
+        index.commit().unwrap();
+        let semantic = "https://docs.example/semantic";
+        let plain = searcher
+            .search(SearchRequest::new(query("needle", &searcher.registry)))
+            .await;
+        let plain_score = plain
+            .results
+            .iter()
+            .find(|result| result.url == semantic)
+            .expect("the index page must be merged")
+            .score;
+
+        Arc::make_mut(&mut searcher.settings).search.embedding_url = format!("http://{address}");
+        let blended = searcher
+            .search(SearchRequest::new(query("needle", &searcher.registry)))
+            .await;
+        server.abort();
+        let blended_score = blended
+            .results
+            .iter()
+            .find(|result| result.url == semantic)
+            .expect("the index page must still be merged")
+            .score;
+        // The blend moves the page to the front, and the merged number now
+        // carries that: it is larger than the plain position score by more
+        // than the position change alone.
+        assert_eq!(blended.results[0].url, semantic);
+        assert!(
+            blended_score > plain_score + 1.0,
+            "semantic score did not reach the merge: {blended_score} vs {plain_score}"
+        );
     }
 
     #[tokio::test]

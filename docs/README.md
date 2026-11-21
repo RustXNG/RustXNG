@@ -14,7 +14,7 @@ RustXNG の文書は目的別に分かれています。初めての場合は RE
 
 ## 検索・索引
 
-- [LOCAL-INDEX.md](LOCAL-INDEX.md): 自前クロール索引の作成、検索、評価手順
+- [LOCAL-INDEX.md](LOCAL-INDEX.md): 自前クロール索引の作成、定期巡回、検索、評価手順
 - [WIKIPEDIA-INDEX.md](WIKIPEDIA-INDEX.md): Wikipedia ダンプ索引の取り込み
 - [SEALQA.md](SEALQA.md): SealQA を用いたオフライン評価
 - [ACCURACY.md](ACCURACY.md): 精度に関する注意

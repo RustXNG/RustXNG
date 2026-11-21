@@ -3,8 +3,10 @@
 //!   rustxng-index crawl --seeds seeds.txt --out ./index-data --max-pages 2000
 //!       [--sitemaps] [--within-seed-path] [--skip-indexed] [--max-per-host N] [--workers N]
 //!       [--since RFC3339] [--prune-missing [--scope PREFIX] [--dry-run]]
+//!   rustxng-index crawl --plan crawl-plan.toml --out ./index-data [--due]
 //!   rustxng-index search --index ./index-data "tokio runtime"
 //!   rustxng-index stats --index ./index-data
+//!   rustxng-index schedule --index ./index-data
 //!
 //! Requests stay on the seed sites, obey robots and page directives, and share
 //! per-host pacing. Downloads, pending URLs, and sitemap traversal are bounded.
@@ -12,15 +14,21 @@
 //! A recrawl replaces the documents it visits and keeps the rest. The deletion
 //! pass (`--prune-missing`) and the freshness cutoff (`--since`) are opt-in and
 //! only run after a complete pass over the scope.
+//!
+//! A plan file declares the sites and how often each is crawled. The next due
+//! time, the last attempt and the consecutive failures are stored with the
+//! index, so an external batch scheduler decides when to start the command and
+//! the command decides which sites are due.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustxng::crawl::{self, Directives};
+use rustxng::localindex::schedule::{self, CrawlPlan, PlannedSite, Schedule};
 use rustxng::localindex::{LocalIndex, Page, has_cjk};
 use rustxng::robots::Robots;
 use scraper::{Html, Selector};
@@ -45,10 +53,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 fn usage() {
     println!(
-        "usage: rustxng-index <crawl|search|stats> [options]
+        "usage: rustxng-index <crawl|search|stats|schedule> [options]
 
 crawl
-  --seeds FILE            seed URLs, one per line (required)
+  --seeds FILE            seed URLs, one per line (required without --plan)
+  --plan FILE             TOML plan of sites and their crawl intervals;
+                          without --due every site is crawled and rescheduled
+  --due                   with --plan: crawl only the sites whose turn it is
   --out DIR, --index DIR  index directory (default index-data)
   --max-pages N           stop after N pages (default 500)
   --max-depth N           follow links N levels deep (default 2)
@@ -75,6 +86,9 @@ search
 stats
   --index DIR             index directory (default index-data)
 
+schedule
+  --index DIR             index directory (default index-data)
+
 --help                  show this text"
     );
 }
@@ -94,6 +108,7 @@ fn main() {
         "crawl" => crawl(&options),
         "search" => search(&options),
         "stats" => stats(&options),
+        "schedule" => report_schedule(&options),
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(2);
@@ -106,8 +121,13 @@ fn main() {
 }
 
 /// Long form flags, kept tiny so the binary has no extra dependencies.
+#[derive(Clone)]
 struct Options {
     seeds: Option<PathBuf>,
+    /// TOML plan of sites and intervals, instead of one seed list.
+    plan: Option<PathBuf>,
+    /// With a plan: crawl only the sites whose interval has elapsed.
+    due: bool,
     index: PathBuf,
     max_pages: usize,
     max_depth: usize,
@@ -143,6 +163,8 @@ impl Options {
     fn parse(args: &[String]) -> Self {
         let mut options = Self {
             seeds: None,
+            plan: None,
+            due: false,
             index: PathBuf::from("index-data"),
             max_pages: 500,
             max_depth: 2,
@@ -171,6 +193,8 @@ impl Options {
             };
             match arg.as_str() {
                 "--seeds" => options.seeds = next().map(PathBuf::from),
+                "--plan" => options.plan = next().map(PathBuf::from),
+                "--due" => options.due = true,
                 "--index" | "--out" => {
                     if let Some(value) = next() {
                         options.index = PathBuf::from(value);
@@ -269,6 +293,51 @@ fn stats(options: &Options) -> Result<(), String> {
     let index = LocalIndex::open(&options.index)?;
     println!("documents: {}", index.document_count());
     Ok(())
+}
+
+/// Print the stored crawl schedule without crawling anything.
+fn report_schedule(options: &Options) -> Result<(), String> {
+    let schedule = Schedule::load(&options.index)?;
+    if schedule.sites().next().is_none() {
+        println!(
+            "schedule: empty ({} has no crawl schedule)",
+            options.index.display()
+        );
+        return Ok(());
+    }
+    for line in schedule_lines(&schedule, schedule::unix_now()) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// One line per site: interval, last attempt, last success, consecutive
+/// failures and the next due time.
+fn schedule_lines(schedule: &Schedule, now: u64) -> Vec<String> {
+    schedule
+        .sites()
+        .map(|(name, state)| {
+            let last_attempt = state
+                .last_attempt
+                .map(format_time)
+                .unwrap_or_else(|| "never".to_string());
+            let last_success = state
+                .last_success
+                .map(format_time)
+                .unwrap_or_else(|| "never".to_string());
+            let due = if state.next_due <= now {
+                "due now"
+            } else {
+                "waiting"
+            };
+            format!(
+                "{name}: interval {}s, last attempt {last_attempt}, last success {last_success}, failures {}, next {} ({due})",
+                state.interval_seconds,
+                state.consecutive_failures,
+                format_time(state.next_due)
+            )
+        })
+        .collect()
 }
 
 /// The title of a page, falling back to the first heading.
@@ -798,12 +867,83 @@ fn seed_directory(url: &str) -> String {
     }
 }
 
-fn crawl(options: &Options) -> Result<(), String> {
-    let client = build_client(&options.contact)?;
-    crawl_with_client(options, client)
+/// What one crawl pass did. The scheduler uses it to decide whether the site
+/// itself failed, which is what advances the backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CrawlSummary {
+    /// Pages this pass wrote to the index.
+    indexed: usize,
+    /// URLs this pass claimed, however the fetch ended.
+    visited: usize,
+    /// Requests that failed outright.
+    failed: usize,
+    /// Hosts that asked us to slow down.
+    backoffs: usize,
 }
 
-fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Result<(), String> {
+impl CrawlSummary {
+    /// Whether the site could not be crawled at all.
+    ///
+    /// A single failed page is normal and stays a page counter. Only a pass
+    /// that wrote nothing while recording failures or back-offs means the site
+    /// itself is in trouble, and only that advances the backoff.
+    fn is_site_failure(self) -> bool {
+        self.visited > 0 && self.indexed == 0 && (self.failed > 0 || self.backoffs > 0)
+    }
+}
+
+fn crawl(options: &Options) -> Result<(), String> {
+    let client = build_client(&options.contact)?;
+    if options.plan.is_some() {
+        crawl_plan(options, client)
+    } else {
+        crawl_with_client(options, client).map(|_| ())
+    }
+}
+
+fn crawl_with_client(
+    options: &Options,
+    client: reqwest::blocking::Client,
+) -> Result<CrawlSummary, String> {
+    if options.due {
+        return Err("--due needs --plan".to_string());
+    }
+    // Check the flags before the seed file, as this path always did: a broken
+    // command line must not depend on whether the file exists.
+    validate_crawl(options)?;
+    since_cutoff(options)?;
+    let seeds_path = options.seeds.as_ref().ok_or("crawl needs --seeds <file>")?;
+    let seeds = read_seeds(seeds_path)?;
+    crawl_seeds(options, client, &seeds)
+}
+
+/// Seeds of one crawl: blank lines and comments are skipped, URLs are
+/// normalised, and a seed that is not a public HTTP(S) URL is refused before
+/// anything is requested.
+fn read_seeds(path: &Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| format!("read {path:?}: {error}"))?;
+    let mut seeds = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(url) = crawl::normalize_url(line) {
+            let parsed = url::Url::parse(&url).map_err(|error| error.to_string())?;
+            if !rustxng::fetch::is_fetchable(&parsed) {
+                return Err(format!("seed is not a public HTTP(S) URL: {url}"));
+            }
+            seeds.push(url);
+        }
+    }
+    if seeds.is_empty() {
+        return Err("no seeds".to_string());
+    }
+    Ok(seeds)
+}
+
+/// Flags that shape every pass, checked before the first request.
+fn validate_crawl(options: &Options) -> Result<(), String> {
     if options.max_pages == 0 {
         return Err("--max-pages must be positive".into());
     }
@@ -832,39 +972,36 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
             return Err(format!("--scope must be an HTTP(S) URL: {prefix}"));
         }
     }
-    let since = match options.since.as_deref() {
-        Some(text) => {
-            if !options.use_sitemaps {
-                return Err(
-                    "--since needs --sitemaps: only sitemap URLs are skipped, so link discovery keeps working"
-                        .into(),
-                );
-            }
-            let parsed = chrono::DateTime::parse_from_rfc3339(text)
-                .map_err(|error| format!("--since is not an RFC 3339 instant ({text}): {error}"))?;
-            Some(parsed.timestamp())
-        }
-        None => None,
+    Ok(())
+}
+
+/// The freshness cutoff from --since, in seconds since the Unix epoch.
+fn since_cutoff(options: &Options) -> Result<Option<i64>, String> {
+    let Some(text) = options.since.as_deref() else {
+        return Ok(None);
     };
-    let seeds_path = options.seeds.as_ref().ok_or("crawl needs --seeds <file>")?;
-    let seeds = std::fs::read_to_string(seeds_path)
-        .map_err(|error| format!("read {seeds_path:?}: {error}"))?;
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-    let mut seed_urls: Vec<String> = Vec::new();
-    for line in seeds.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(url) = crawl::normalize_url(line) {
-            let parsed = url::Url::parse(&url).map_err(|error| error.to_string())?;
-            if !rustxng::fetch::is_fetchable(&parsed) {
-                return Err(format!("seed is not a public HTTP(S) URL: {url}"));
-            }
-            seed_urls.push(url.clone());
-            queue.push_back((url, 0));
-        }
+    if !options.use_sitemaps {
+        return Err(
+            "--since needs --sitemaps: only sitemap URLs are skipped, so link discovery keeps working"
+                .into(),
+        );
     }
+    let parsed = chrono::DateTime::parse_from_rfc3339(text)
+        .map_err(|error| format!("--since is not an RFC 3339 instant ({text}): {error}"))?;
+    Ok(Some(parsed.timestamp()))
+}
+
+/// Crawl one site's seeds. Every pass, whether it comes from --seeds or from
+/// one site of a plan, goes through here, so the flags keep one meaning.
+fn crawl_seeds(
+    options: &Options,
+    client: reqwest::blocking::Client,
+    seed_urls: &[String],
+) -> Result<CrawlSummary, String> {
+    validate_crawl(options)?;
+    let since = since_cutoff(options)?;
+    let mut queue: VecDeque<(String, usize)> =
+        seed_urls.iter().map(|url| (url.clone(), 0)).collect();
     if queue.is_empty() {
         return Err("no seeds".to_string());
     }
@@ -1095,7 +1232,7 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
                 .seen
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            prune_missing(&index, options, &seed_urls, &seen)?;
+            prune_missing(&index, options, seed_urls, &seen)?;
         }
     }
 
@@ -1114,7 +1251,161 @@ fn crawl_with_client(options: &Options, client: reqwest::blocking::Client) -> Re
         counters.failed.load(Ordering::Relaxed),
         counters.backoffs.load(Ordering::Relaxed),
     );
-    Ok(())
+    let visited = crawl.seen.lock().map(|seen| seen.len()).unwrap_or_default();
+    Ok(CrawlSummary {
+        indexed,
+        visited,
+        failed: counters.failed.load(Ordering::Relaxed),
+        backoffs: counters.backoffs.load(Ordering::Relaxed),
+    })
+}
+
+/// Run the sites of a plan, each as its own pass.
+///
+/// The state file records the next due time, so an external scheduler can
+/// start this command as often as it likes: with `--due` only the sites whose
+/// interval has elapsed are crawled. Without `--due` every site is crawled and
+/// rescheduled, which is the manual "refresh now" form.
+fn crawl_plan(options: &Options, client: reqwest::blocking::Client) -> Result<(), String> {
+    if options.seeds.is_some() {
+        return Err("--plan lists the seeds; do not pass --seeds as well".to_string());
+    }
+    let plan_path = options
+        .plan
+        .as_ref()
+        .ok_or("crawl needs --seeds <file> or --plan <file>")?;
+    let text = std::fs::read_to_string(plan_path)
+        .map_err(|error| format!("read {plan_path:?}: {error}"))?;
+    let plan = CrawlPlan::parse(&text).map_err(|error| format!("{plan_path:?}: {error}"))?;
+    if plan.is_empty() {
+        return Err(format!("{plan_path:?} declares no sites"));
+    }
+    validate_crawl(options)?;
+    if let Some(text) = options.since.as_deref() {
+        // Check the instant and the flag once, not once per site, so a plan
+        // that is not due today still reports a broken command line.
+        chrono::DateTime::parse_from_rfc3339(text)
+            .map_err(|error| format!("--since is not an RFC 3339 instant ({text}): {error}"))?;
+        let sitemaps = |site: &PlannedSite| site.sitemaps.unwrap_or(options.use_sitemaps);
+        if !plan.sites().iter().all(sitemaps) {
+            return Err(
+                "--since needs --sitemaps for every planned site: only sitemap URLs are skipped, so link discovery keeps working"
+                    .into(),
+            );
+        }
+    }
+    let mut schedule = Schedule::load(&options.index)?;
+    let now = schedule::unix_now();
+    for site in plan.sites() {
+        schedule.plan_site(&site.name, site.interval_seconds, now);
+    }
+    let due = plan
+        .sites()
+        .iter()
+        .filter(|site| !options.due || schedule.is_due(&site.name, now))
+        .count();
+    if due > 0 {
+        // Take the index's write lock once before any outcome is recorded. A
+        // second crawler has to fail here instead of looking like a site
+        // failure, which would push that site's next run out by an interval.
+        drop(LocalIndex::open_for_write(&options.index)?);
+    }
+    println!(
+        "plan: {} sites, {} due{}",
+        plan.sites().len(),
+        due,
+        if options.due { "" } else { " (forced run)" }
+    );
+    let mut failed: Vec<String> = Vec::new();
+    for site in plan.sites() {
+        if options.due && !schedule.is_due(&site.name, now) {
+            let next_due = schedule
+                .get(&site.name)
+                .map(|state| state.next_due)
+                .unwrap_or(now);
+            println!(
+                "site {}: waiting until {}",
+                site.name,
+                format_time(next_due)
+            );
+            continue;
+        }
+        let mut site_options = options.clone();
+        site_options.plan = None;
+        site_options.due = false;
+        site_options.seeds = None;
+        site_options.use_sitemaps = site.sitemaps.unwrap_or(options.use_sitemaps);
+        site_options.max_pages = site.max_pages.unwrap_or(options.max_pages);
+        site_options.within_seed_path = site.within_seed_path.unwrap_or(options.within_seed_path);
+        // A site's own scope is only meaningful for the deletion pass; a
+        // run without --prune-missing ignores it instead of failing.
+        if options.prune_missing && !site.scope.is_empty() {
+            site_options.scope = site.scope.clone();
+        }
+        println!(
+            "site {}: crawling {} seed(s), interval {}s",
+            site.name,
+            site.seeds.len(),
+            site.interval_seconds
+        );
+        let started = schedule::unix_now();
+        let outcome = crawl_seeds(&site_options, client.clone(), &site.seeds);
+        let finished = schedule::unix_now();
+        let error = match outcome {
+            Ok(summary) if !summary.is_site_failure() => {
+                schedule.record_success(&site.name, site.interval_seconds, started, finished);
+                None
+            }
+            Ok(summary) => {
+                schedule.record_failure(&site.name, site.interval_seconds, started, finished);
+                Some(format!(
+                    "nothing could be indexed ({} visited, {} failed, {} back-offs)",
+                    summary.visited, summary.failed, summary.backoffs
+                ))
+            }
+            Err(error) => {
+                schedule.record_failure(&site.name, site.interval_seconds, started, finished);
+                Some(error)
+            }
+        };
+        // Save after every site: a crash or a kill mid-plan keeps the outcome
+        // of the sites that already ran.
+        schedule.save(&options.index)?;
+        match error {
+            Some(error) => {
+                eprintln!("site {}: failed: {error}", site.name);
+                failed.push(site.name.clone());
+            }
+            None => {
+                let next_due = schedule
+                    .get(&site.name)
+                    .map(|state| state.next_due)
+                    .unwrap_or(finished);
+                println!(
+                    "site {}: ok, next crawl at {}",
+                    site.name,
+                    format_time(next_due)
+                );
+            }
+        }
+    }
+    schedule.save(&options.index)?;
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {} sites failed: {}",
+            failed.len(),
+            plan.sites().len(),
+            failed.join(", ")
+        ))
+    }
+}
+
+/// A Unix timestamp as RFC 3339 UTC, for the schedule output.
+fn format_time(seconds: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Whether the deletion pass covers a URL: one of the `--scope` prefixes, or
@@ -2053,6 +2344,340 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(stale, ["/a", "/b"]);
+    }
+
+    /// Options for a plan run over a temporary index.
+    fn plan_options(directory: &tempfile::TempDir, plan: &Path) -> Options {
+        let mut options = Options::parse(&[]);
+        options.plan = Some(plan.to_path_buf());
+        options.index = directory.path().join("index");
+        options.delay_ms = 0;
+        options.workers = 1;
+        options
+    }
+
+    fn write_plan(directory: &tempfile::TempDir, text: &str) -> PathBuf {
+        let path = directory.path().join("crawl-plan.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_plan_crawls_only_due_sites_and_records_the_next_run() {
+        let server = TestServer::new(|_, path, _| match path {
+            "/robots.txt" => reply(200, "", ""),
+            "/" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>Root</title><p>rootvalue</p>",
+            ),
+            _ => panic!("unexpected request: {path}"),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let plan = write_plan(
+            &directory,
+            &format!(
+                "[[site]]\nname = \"example\"\nseeds = [\"{}\"]\ninterval = \"24h\"\n",
+                server.url("/")
+            ),
+        );
+        let mut options = plan_options(&directory, &plan);
+        options.due = true;
+        crawl_plan(&options, server.client()).unwrap();
+        assert_eq!(
+            LocalIndex::open(&options.index).unwrap().document_count(),
+            1
+        );
+        let state = Schedule::load(&options.index).unwrap();
+        let site = state.get("example").unwrap();
+        assert_eq!(site.interval_seconds, 86_400);
+        assert_eq!(site.consecutive_failures, 0);
+        assert!(site.last_success.is_some());
+        assert!(site.next_due > schedule::unix_now());
+        let requests = server.paths().len();
+        assert!(requests > 0);
+
+        // A later index commit leaves the schedule file alone: it is not part
+        // of the index's managed set.
+        {
+            let index = LocalIndex::open_for_write(&options.index).unwrap();
+            index.commit().unwrap();
+        }
+        assert!(
+            Schedule::load(&options.index)
+                .unwrap()
+                .get("example")
+                .is_some()
+        );
+
+        // The interval has not elapsed: the next invocation does nothing.
+        crawl_plan(&options, server.client()).unwrap();
+        assert_eq!(server.paths().len(), requests);
+
+        // An elapsed interval makes the site due again.
+        std::fs::write(
+            options.index.join(schedule::SCHEDULE_FILE),
+            serde_json::json!({
+                "version": 1,
+                "sites": {
+                    "example": {
+                        "interval_seconds": 86_400,
+                        "last_attempt": 1,
+                        "last_success": 1,
+                        "consecutive_failures": 0,
+                        "next_due": 0
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crawl_plan(&options, server.client()).unwrap();
+        assert!(server.paths().len() > requests);
+    }
+
+    #[test]
+    fn a_failing_site_backs_off_and_a_success_resets_the_interval() {
+        let recovered = Arc::new(AtomicBool::new(false));
+        let current = Arc::clone(&recovered);
+        let server = TestServer::new(move |_, path, _| match path {
+            "/robots.txt" => reply(200, "", ""),
+            "/" if current.load(Ordering::SeqCst) => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>Root</title><p>rootvalue</p>",
+            ),
+            "/" => reply(500, "", "temporarily unavailable"),
+            _ => panic!("unexpected request: {path}"),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let plan = write_plan(
+            &directory,
+            &format!(
+                "[[site]]\nname = \"example\"\nseeds = [\"{}\"]\ninterval = \"1h\"\n",
+                server.url("/")
+            ),
+        );
+        let options = plan_options(&directory, &plan);
+        // Every page of the site failed: the site itself is in trouble, so
+        // the scheduler has to back off instead of waiting the interval.
+        let error = crawl_plan(&options, server.client()).unwrap_err();
+        assert!(error.contains("1 of 1 sites failed"), "{error}");
+        assert!(!server.paths().is_empty());
+        let state = Schedule::load(&options.index).unwrap();
+        let site = state.get("example").unwrap();
+        assert_eq!(site.consecutive_failures, 1);
+        assert!(site.last_success.is_none());
+        assert!(site.next_due >= site.last_attempt.unwrap() + 3_600);
+
+        // The same site succeeds next time; the counter and the wait reset.
+        recovered.store(true, Ordering::SeqCst);
+        crawl_plan(&options, server.client()).unwrap();
+        let state = Schedule::load(&options.index).unwrap();
+        let site = state.get("example").unwrap();
+        assert_eq!(site.consecutive_failures, 0);
+        assert_eq!(site.next_due, site.last_success.unwrap() + 3_600);
+        assert!(site.last_success.unwrap() >= site.last_attempt.unwrap());
+    }
+
+    #[test]
+    fn a_planned_pass_prunes_only_inside_its_own_site() {
+        let server = TestServer::new(|_, path, _| match path {
+            "/robots.txt" => reply(200, "", ""),
+            "/" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>Root</title><p>rootvalue</p>",
+            ),
+            _ => panic!("unexpected request: {path}"),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let plan = write_plan(
+            &directory,
+            &format!(
+                "[[site]]\nname = \"example\"\nseeds = [\"{}\"]\ninterval = \"24h\"\n",
+                server.url("/")
+            ),
+        );
+        let mut options = plan_options(&directory, &plan);
+        options.prune_missing = true;
+        let inside = server.url("/gone").to_string();
+        let outside = "https://other.example/gone".to_string();
+        {
+            let index = LocalIndex::open_for_write(&options.index).unwrap();
+            for url in [&inside, &outside] {
+                index
+                    .add(&Page {
+                        url,
+                        title: "Gone",
+                        body: "gonevalue",
+                        lang: "en",
+                        snippet: "",
+                    })
+                    .unwrap();
+            }
+            index.commit().unwrap();
+        }
+        crawl_plan(&options, server.client()).unwrap();
+        let index = LocalIndex::open(&options.index).unwrap();
+        assert!(
+            !index.has_url(&inside),
+            "an unvisited document of the site is a deletion"
+        );
+        assert!(
+            index.has_url(&outside),
+            "another site's documents are out of scope"
+        );
+    }
+
+    #[test]
+    fn a_planned_pass_applies_the_freshness_cutoff() {
+        let server = TestServer::new(|_, path, base| match path {
+            "/robots.txt" => reply(200, "", &format!("Sitemap: {base}/sitemap.xml\n")),
+            "/sitemap.xml" => reply(
+                200,
+                "",
+                &format!(
+                    "<urlset><url><loc>{base}/a</loc></url><url><loc>{base}/b</loc></url></urlset>"
+                ),
+            ),
+            "/" => reply(200, "Content-Type: text/html\r\n", "<title>Root</title>"),
+            "/a" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>A</title><p>avalue</p>",
+            ),
+            "/b" => reply(
+                200,
+                "Content-Type: text/html\r\n",
+                "<title>B</title><p>bvalue</p>",
+            ),
+            _ => panic!("unexpected request: {path}"),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let plan = write_plan(
+            &directory,
+            &format!(
+                "[[site]]\nname = \"example\"\nseeds = [\"{}\"]\ninterval = \"24h\"\nsitemaps = true\n",
+                server.url("/")
+            ),
+        );
+        let mut options = plan_options(&directory, &plan);
+        options.due = true;
+        options.max_pages = 10;
+        crawl_plan(&options, server.client()).unwrap();
+        {
+            let index = LocalIndex::open(&options.index).unwrap();
+            assert_eq!(index.document_count(), 3);
+        }
+
+        // Every page was indexed after this cutoff, so the plan refetches
+        // nothing. A plan run without --due runs even though the site is not
+        // due, which is how an operator asks for "check again now".
+        options.due = false;
+        options.since = Some(
+            (chrono::Utc::now() - chrono::Duration::seconds(3_600))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        let before = server.paths().len();
+        crawl_plan(&options, server.client()).unwrap();
+        let fresh: Vec<String> = server.paths()[before..]
+            .iter()
+            .filter(|path| path.as_str() == "/a" || path.as_str() == "/b")
+            .cloned()
+            .collect();
+        assert!(fresh.is_empty(), "fresh pages were refetched: {fresh:?}");
+
+        // Everything is older than this cutoff, so both pages are fetched
+        // again: the cutoff has the same meaning as in a --seeds run.
+        options.since = Some(
+            (chrono::Utc::now() + chrono::Duration::seconds(3_600))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        let before = server.paths().len();
+        crawl_plan(&options, server.client()).unwrap();
+        let stale: Vec<String> = server.paths()[before..]
+            .iter()
+            .filter(|path| path.as_str() == "/a" || path.as_str() == "/b")
+            .cloned()
+            .collect();
+        assert_eq!(stale, ["/a", "/b"]);
+    }
+
+    #[test]
+    fn plan_mode_rejects_ambiguous_flag_combinations() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = mock_client("127.0.0.1:9".parse().unwrap(), "");
+        let mut options = Options::parse(&[]);
+        options.index = directory.path().join("index");
+        options.due = true;
+        let error = crawl_with_client(&options, client.clone()).unwrap_err();
+        assert!(error.contains("--due needs --plan"), "{error}");
+
+        options.due = false;
+        let seeds = directory.path().join("seeds.txt");
+        std::fs::write(&seeds, "https://example.test/").unwrap();
+        options.seeds = Some(seeds);
+        let plan = write_plan(
+            &directory,
+            "[[site]]\nseeds = [\"https://example.test/\"]\ninterval = \"1h\"\n",
+        );
+        options.plan = Some(plan);
+        let error = crawl_plan(&options, client.clone()).unwrap_err();
+        assert!(error.contains("do not pass --seeds"), "{error}");
+
+        options.seeds = None;
+        // A plan that cannot be parsed fails before any site runs.
+        let broken = write_plan(
+            &directory,
+            "[[site]]\nseeds = [\"https://example.test/\"]\ninterval = \"soon\"\n",
+        );
+        options.plan = Some(broken);
+        let error = crawl_plan(&options, client).unwrap_err();
+        assert!(error.contains("interval"), "{error}");
+    }
+
+    #[test]
+    fn a_plan_refuses_an_index_another_crawler_is_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = write_plan(
+            &directory,
+            "[[site]]\nname = \"example\"\nseeds = [\"https://example.test/\"]\ninterval = \"1h\"\n",
+        );
+        let options = plan_options(&directory, &plan);
+        let held = LocalIndex::open_for_write(&options.index).unwrap();
+        let error =
+            crawl_plan(&options, mock_client("127.0.0.1:9".parse().unwrap(), "")).unwrap_err();
+        assert!(error.contains("writer"), "{error}");
+        // The lock conflict is not the site's fault: it must not be recorded
+        // as a failure that pushes the next run out by an interval.
+        assert!(
+            Schedule::load(&options.index)
+                .unwrap()
+                .get("example")
+                .is_none()
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn schedule_lines_report_due_and_waiting_sites() {
+        let mut schedule = Schedule::default();
+        schedule.record_success("fresh.example", 3_600, 1_000, 1_000);
+        schedule.record_failure("broken.example", 600, 1_000, 1_000);
+        let lines = schedule_lines(&schedule, 2_000);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].starts_with("broken.example: interval 600s"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("failures 1"), "{lines:?}");
+        assert!(lines[0].contains("due now"), "{lines:?}");
+        assert!(
+            lines[1].starts_with("fresh.example: interval 3600s"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("waiting"), "{lines:?}");
     }
 
     #[test]
