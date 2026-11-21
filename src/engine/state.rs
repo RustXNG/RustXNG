@@ -2,14 +2,14 @@
 //! error handling in `searx/engines/__init__.py` (`ban_time_on_fail`,
 //! `max_ban_time_on_fail` and `suspended_times`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use super::FailureKind;
-use crate::settings::Search;
+use crate::settings::{CircuitSettings, Search};
 
 /// Consecutive suspensions of one engine climb this ladder and stop at the
 /// last entry: 1 h, 6 h, 24 h, 7 days. The first suspension uses the window
@@ -39,6 +39,223 @@ impl EngineStats {
     }
 }
 
+/// Circuit breaker phase of one engine.
+///
+/// Hard blocks (access denied, CAPTCHA, 429) suspend an engine outright
+/// through `suspended_times`; the circuit is the softer statistical layer in
+/// front of the soft failures (timeouts, HTTP and parse errors). It judges the
+/// last `window` outcomes and opens when enough of them failed, so an engine
+/// that keeps failing half of the time steps out of the rotation for a while
+/// instead of costing every search its deadline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitState {
+    /// Normal operation.
+    #[default]
+    Closed,
+    /// The engine is skipped until the open period is over.
+    Open,
+    /// The open period is over: one trial is allowed, its outcome decides.
+    HalfOpen,
+}
+
+impl CircuitState {
+    /// Stable label used by `/stats` and the unresponsive-engine reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::HalfOpen => "half-open",
+        }
+    }
+}
+
+/// What the circuit breaker decides for the engine that is about to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitAdmission {
+    /// Run the engine; it is part of the normal rotation.
+    Allow,
+    /// Run the engine as the single half-open trial. The outcome must be
+    /// recorded through [`EngineStates::record_success`] or
+    /// [`EngineStates::record_failure`].
+    Trial,
+    /// Leave the engine out of this search.
+    Skip {
+        /// `Open`, or `HalfOpen` while another trial is running.
+        state: CircuitState,
+        /// Time until the circuit may allow the next trial.
+        remaining: Duration,
+    },
+}
+
+/// Rolling outcome window and transition bookkeeping of one engine.
+#[derive(Debug, Clone, Default)]
+struct Circuit {
+    state: CircuitState,
+    /// The last outcomes, oldest first; `true` marks a failure.
+    outcomes: VecDeque<bool>,
+    /// When an open circuit allows its trial.
+    open_until: Option<Instant>,
+    /// Deadline of the half-open trial that was handed out.
+    trial_until: Option<Instant>,
+    /// Consecutive re-openings, the position in the open-period ladder.
+    open_streak: u32,
+}
+
+impl Circuit {
+    fn failures(&self) -> usize {
+        self.outcomes.iter().filter(|failed| **failed).count()
+    }
+
+    fn failure_ratio(&self) -> f64 {
+        if self.outcomes.is_empty() {
+            0.0
+        } else {
+            self.failures() as f64 / self.outcomes.len() as f64
+        }
+    }
+
+    /// Push one outcome into the window, dropping the oldest.
+    fn push(&mut self, failed: bool, settings: &CircuitSettings) {
+        self.outcomes.push_back(failed);
+        while self.outcomes.len() > settings.effective_window() {
+            self.outcomes.pop_front();
+        }
+    }
+
+    /// Whether the current window is bad enough to open the circuit.
+    fn overtaxed(&self, settings: &CircuitSettings) -> bool {
+        self.outcomes.len() >= settings.effective_minimum_samples()
+            && self.failures() > 0
+            && self.failure_ratio() >= settings.effective_failure_ratio()
+    }
+
+    /// How long the next opening keeps the engine out: the first step is
+    /// `open_seconds`, every failed trial doubles it up to
+    /// `max_open_seconds`.
+    fn open_period(&self, settings: &CircuitSettings) -> Duration {
+        let base = settings.effective_open_seconds();
+        let ceiling = settings.effective_max_open_seconds();
+        let doubled = base.saturating_mul(1u64 << self.open_streak.min(32));
+        Duration::from_secs(doubled.min(ceiling))
+    }
+
+    fn open(&mut self, settings: &CircuitSettings, now: Instant) {
+        self.state = CircuitState::Open;
+        self.open_until = Some(now + self.open_period(settings));
+        self.trial_until = None;
+    }
+
+    fn close(&mut self) {
+        self.state = CircuitState::Closed;
+        self.open_until = None;
+        self.trial_until = None;
+        self.open_streak = 0;
+        self.outcomes.clear();
+    }
+
+    /// Record one engine outcome.
+    ///
+    /// `counted` is false for a hard block: those suspend through
+    /// `suspended_times`, and counting them here would open a circuit for a
+    /// reason the suspension already explains. A hard block that ends a
+    /// half-open trial still re-opens the circuit, because the trial itself is
+    /// what failed.
+    fn record(&mut self, failed: bool, counted: bool, settings: &CircuitSettings, now: Instant) {
+        match self.state {
+            // Requests that were already running when the circuit opened say
+            // nothing about the next trial.
+            CircuitState::Open => {}
+            CircuitState::HalfOpen => {
+                self.trial_until = None;
+                if failed {
+                    self.open_streak = self.open_streak.saturating_add(1);
+                    self.open(settings, now);
+                } else {
+                    self.close();
+                }
+            }
+            CircuitState::Closed if counted => {
+                self.push(failed, settings);
+                if self.overtaxed(settings) {
+                    self.open_streak = 0;
+                    self.open(settings, now);
+                }
+            }
+            CircuitState::Closed => {}
+        }
+    }
+
+    /// Decide whether the engine may start now.
+    fn admission(&mut self, settings: &CircuitSettings, now: Instant) -> CircuitAdmission {
+        match self.state {
+            CircuitState::Closed => CircuitAdmission::Allow,
+            CircuitState::Open => match self.open_until {
+                Some(until) if until > now => CircuitAdmission::Skip {
+                    state: CircuitState::Open,
+                    remaining: until - now,
+                },
+                // The open period is over: allow one trial.
+                _ => self.grant_trial(settings, now),
+            },
+            CircuitState::HalfOpen => match self.trial_until {
+                // Another request is already running the trial.
+                Some(until) if until > now => CircuitAdmission::Skip {
+                    state: CircuitState::HalfOpen,
+                    remaining: until - now,
+                },
+                // The trial never reported back: give the next request one.
+                _ => self.grant_trial(settings, now),
+            },
+        }
+    }
+
+    fn grant_trial(&mut self, settings: &CircuitSettings, now: Instant) -> CircuitAdmission {
+        self.state = CircuitState::HalfOpen;
+        self.trial_until = Some(now + self.open_period(settings));
+        CircuitAdmission::Trial
+    }
+
+    /// The state to report: an elapsed open period already counts as
+    /// half-open, even before a trial was handed out.
+    fn report_state(&self, now: Instant) -> CircuitState {
+        match self.state {
+            CircuitState::Open if self.open_until.is_none_or(|until| until <= now) => {
+                CircuitState::HalfOpen
+            }
+            state => state,
+        }
+    }
+
+    fn remaining_open(&self, now: Instant) -> Duration {
+        match self.state {
+            CircuitState::Open => self
+                .open_until
+                .map(|until| until.saturating_duration_since(now))
+                .unwrap_or_default(),
+            _ => Duration::ZERO,
+        }
+    }
+}
+
+/// Hard blocks suspend through `suspended_times`; the circuit judges the
+/// softer failures that a suspension does not cover well.
+fn feeds_circuit(kind: FailureKind) -> bool {
+    !matches!(
+        kind,
+        FailureKind::AccessDenied | FailureKind::Captcha | FailureKind::TooManyRequests
+    )
+}
+
+/// Record an outcome in the engine's circuit, if the breaker is enabled.
+fn observe_circuit(state: &mut EngineState, failed: bool, counted: bool, settings: &Search) {
+    if settings.circuit.enabled {
+        state
+            .circuit
+            .record(failed, counted, &settings.circuit, Instant::now());
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct EngineState {
     consecutive_failures: u64,
@@ -52,6 +269,7 @@ struct EngineState {
     /// Number of consecutive hard-block suspensions, the backoff ladder
     /// position. Reset by a successful request.
     suspension_streak: u64,
+    circuit: Circuit,
     stats: EngineStats,
 }
 
@@ -68,6 +286,14 @@ pub struct EngineSnapshot {
     pub resting: bool,
     /// Remaining rest time in seconds.
     pub resting_for: f64,
+    /// Circuit breaker phase (`closed`, `open` or `half_open`).
+    pub circuit: CircuitState,
+    /// Seconds until a half-open trial is allowed; 0 unless the circuit is open.
+    pub circuit_open_for: f64,
+    /// Failure share of the rolling window.
+    pub circuit_failure_ratio: f64,
+    /// Outcomes currently in the rolling window.
+    pub circuit_samples: u64,
 }
 
 /// Thread safe map of engine states.
@@ -116,6 +342,20 @@ impl EngineStates {
         })
     }
 
+    /// Consult the circuit breaker before starting an engine.
+    ///
+    /// A [`CircuitAdmission::Trial`] consumes the single half-open trial, so
+    /// the caller has to record the outcome afterwards even when it decides
+    /// not to run the engine.
+    pub fn circuit_admission(&self, engine: &str, settings: &Search) -> CircuitAdmission {
+        if !settings.circuit.enabled {
+            return CircuitAdmission::Allow;
+        }
+        self.with_state(engine, |state| {
+            state.circuit.admission(&settings.circuit, Instant::now())
+        })
+    }
+
     /// Record a successful request.
     pub fn record_success(
         &self,
@@ -125,6 +365,7 @@ impl EngineStates {
         settings: &Search,
     ) {
         self.with_state(engine, |state| {
+            observe_circuit(state, false, true, settings);
             state.consecutive_failures = 0;
             state.suspension_streak = 0;
             if results == 0 {
@@ -152,6 +393,7 @@ impl EngineStates {
     /// Record a failure and return the suspension time in seconds (0 = none).
     pub fn record_failure(&self, engine: &str, kind: FailureKind, settings: &Search) -> u64 {
         self.with_state(engine, |state| {
+            observe_circuit(state, true, feeds_circuit(kind), settings);
             state.stats.errors += 1;
             if kind == FailureKind::Timeout {
                 state.stats.timeouts += 1;
@@ -238,6 +480,10 @@ impl EngineStates {
                     suspension_reason,
                     resting,
                     resting_for,
+                    circuit: state.circuit.report_state(now),
+                    circuit_open_for: state.circuit.remaining_open(now).as_secs_f64(),
+                    circuit_failure_ratio: state.circuit.failure_ratio(),
+                    circuit_samples: state.circuit.outcomes.len() as u64,
                 }
             })
             .collect();
@@ -551,6 +797,237 @@ mod tests {
         let (_, reason_b) = states.suspension("b").unwrap();
         assert_ne!(reason_a, reason_b);
         assert_eq!(reason_b.as_deref(), Some("resting"));
+    }
+
+    /// Settings with a circuit that opens on the tested window.
+    fn circuit_search(circuit: CircuitSettings) -> Search {
+        Search {
+            circuit,
+            ..Default::default()
+        }
+    }
+
+    fn circuit(window: usize, minimum_samples: usize, ratio: f64) -> CircuitSettings {
+        CircuitSettings {
+            window,
+            minimum_samples,
+            failure_ratio: ratio,
+            open_seconds: 30,
+            max_open_seconds: 600,
+            ..Default::default()
+        }
+    }
+
+    /// Move an open circuit past its open period, the way wall-clock time
+    /// would after `open_seconds`.
+    fn expire_open_period(states: &EngineStates, engine: &str) {
+        states.with_state(engine, |state| {
+            state.circuit.open_until = Some(Instant::now() - Duration::from_secs(1));
+            state.circuit.trial_until = None;
+        });
+    }
+
+    fn circuit_of(states: &EngineStates, engine: &str) -> EngineSnapshot {
+        states
+            .snapshot()
+            .into_iter()
+            .find(|snapshot| snapshot.engine == engine)
+            .expect("the engine is tracked")
+    }
+
+    #[test]
+    fn circuit_opens_when_the_window_reaches_the_failure_ratio() {
+        let states = EngineStates::new();
+        let settings = circuit_search(circuit(4, 4, 0.5));
+
+        // Three outcomes say nothing yet, even with a failure in every one.
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        states.record_success("eng", 1, Duration::from_millis(20), &settings);
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        assert_eq!(
+            states.circuit_admission("eng", &settings),
+            CircuitAdmission::Allow,
+            "the minimum sample count is not reached"
+        );
+
+        // The fourth outcome completes the window at exactly 50%: it opens.
+        states.record_success("eng", 1, Duration::from_millis(20), &settings);
+        match states.circuit_admission("eng", &settings) {
+            CircuitAdmission::Skip { state, remaining } => {
+                assert_eq!(state, CircuitState::Open);
+                assert!(remaining > Duration::ZERO);
+            }
+            other => panic!("the circuit must be open at the threshold, got {other:?}"),
+        }
+
+        let snapshot = circuit_of(&states, "eng");
+        assert_eq!(snapshot.circuit, CircuitState::Open);
+        assert!(snapshot.circuit_open_for > 0.0);
+        assert_eq!(snapshot.circuit_samples, 4);
+        assert!((snapshot.circuit_failure_ratio - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_window_below_the_failure_ratio_stays_closed() {
+        let states = EngineStates::new();
+        let settings = circuit_search(circuit(4, 4, 0.5));
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        for _ in 0..3 {
+            states.record_success("eng", 1, Duration::from_millis(20), &settings);
+        }
+        assert_eq!(
+            states.circuit_admission("eng", &settings),
+            CircuitAdmission::Allow,
+            "one failure in four outcomes is below the threshold"
+        );
+        assert_eq!(circuit_of(&states, "eng").circuit, CircuitState::Closed);
+    }
+
+    #[test]
+    fn an_open_circuit_allows_one_trial_after_the_open_period() {
+        let states = EngineStates::new();
+        let settings = circuit_search(circuit(2, 2, 1.0));
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+
+        assert!(matches!(
+            states.circuit_admission("eng", &settings),
+            CircuitAdmission::Skip {
+                state: CircuitState::Open,
+                ..
+            }
+        ));
+
+        expire_open_period(&states, "eng");
+        assert_eq!(
+            states.circuit_admission("eng", &settings),
+            CircuitAdmission::Trial,
+            "the open period is over: one trial is allowed"
+        );
+        assert!(
+            matches!(
+                states.circuit_admission("eng", &settings),
+                CircuitAdmission::Skip {
+                    state: CircuitState::HalfOpen,
+                    ..
+                }
+            ),
+            "a running trial is not doubled by a concurrent request"
+        );
+        assert_eq!(circuit_of(&states, "eng").circuit, CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn a_successful_trial_closes_the_circuit() {
+        let states = EngineStates::new();
+        let settings = circuit_search(circuit(2, 2, 1.0));
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        expire_open_period(&states, "eng");
+        assert_eq!(
+            states.circuit_admission("eng", &settings),
+            CircuitAdmission::Trial
+        );
+
+        states.record_success("eng", 2, Duration::from_millis(30), &settings);
+
+        assert_eq!(
+            states.circuit_admission("eng", &settings),
+            CircuitAdmission::Allow,
+            "a successful trial returns the engine to the rotation"
+        );
+        let snapshot = circuit_of(&states, "eng");
+        assert_eq!(snapshot.circuit, CircuitState::Closed);
+        assert_eq!(snapshot.circuit_open_for, 0.0);
+        assert_eq!(
+            snapshot.circuit_samples, 0,
+            "the window starts over after a close"
+        );
+    }
+
+    #[test]
+    fn a_failed_trial_reopens_with_a_longer_bounded_period() {
+        let states = EngineStates::new();
+        let settings = circuit_search(circuit(2, 2, 1.0));
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        let first = circuit_of(&states, "eng").circuit_open_for;
+        assert!(first > 0.0 && first <= 30.0, "first period: {first}");
+
+        expire_open_period(&states, "eng");
+        assert_eq!(
+            states.circuit_admission("eng", &settings),
+            CircuitAdmission::Trial
+        );
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        let second = circuit_of(&states, "eng").circuit_open_for;
+        assert_eq!(circuit_of(&states, "eng").circuit, CircuitState::Open);
+        assert!(
+            second > 55.0 && second <= 60.0,
+            "a failed trial doubles the period: {second}"
+        );
+
+        // The ladder is bounded: with a 45 second ceiling the next re-open
+        // stops there instead of doubling to 120.
+        let states = EngineStates::new();
+        let settings = circuit_search(CircuitSettings {
+            max_open_seconds: 45,
+            ..circuit(2, 2, 1.0)
+        });
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        expire_open_period(&states, "eng");
+        assert_eq!(
+            states.circuit_admission("eng", &settings),
+            CircuitAdmission::Trial
+        );
+        states.record_failure("eng", FailureKind::Timeout, &settings);
+        let capped = circuit_of(&states, "eng").circuit_open_for;
+        assert!(
+            capped > 40.0 && capped <= 45.0,
+            "the period is capped at max_open_seconds: {capped}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_circuit_never_opens() {
+        let states = EngineStates::new();
+        let settings = circuit_search(CircuitSettings {
+            enabled: false,
+            ..circuit(2, 2, 1.0)
+        });
+        for _ in 0..10 {
+            states.record_failure("eng", FailureKind::Timeout, &settings);
+            assert_eq!(
+                states.circuit_admission("eng", &settings),
+                CircuitAdmission::Allow
+            );
+        }
+        let snapshot = circuit_of(&states, "eng");
+        assert_eq!(snapshot.circuit, CircuitState::Closed);
+        assert_eq!(
+            snapshot.circuit_samples, 0,
+            "a disabled circuit keeps no window"
+        );
+    }
+
+    #[test]
+    fn hard_blocks_do_not_feed_the_circuit() {
+        let states = EngineStates::new();
+        let settings = circuit_search(circuit(2, 2, 1.0));
+
+        // A hard block owns its suspension; the statistical layer stays out
+        // of the way.
+        states.record_failure("eng", FailureKind::AccessDenied, &settings);
+        states.record_failure("eng", FailureKind::Captcha, &settings);
+        states.record_failure("eng", FailureKind::TooManyRequests, &settings);
+
+        assert_eq!(
+            states.circuit_admission("eng", &settings),
+            CircuitAdmission::Allow,
+            "hard blocks are the suspension ladder's business"
+        );
+        assert_eq!(circuit_of(&states, "eng").circuit, CircuitState::Closed);
     }
 
     #[test]
