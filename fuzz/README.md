@@ -43,9 +43,9 @@ coverage 誘導の fuzzing には cargo-fuzz（nightly の SanitizerCoverage）�
 入力長は 4 KiB 程度で足りる（`-max_len=4096`）。長時間回すときは
 `-rss_limit_mb=2048` を明示すると、巨大確保を OOM として検出できる。
 
-## 既知の検出（2026-11-21）
+## 検出済み（2026-11-21、修正済み）
 
-`resp_reply` は、応答が告知したバルク長をそのまま確保する箇所を検出する。
+`resp_reply` が、応答の告知したバルク長をそのまま確保する箇所を検出した。
 
 ```
 $ printf '$999999999999\r\n' > /tmp/oom/seed
@@ -55,12 +55,26 @@ memory allocation of 999999999999 bytes failed
 SUMMARY: libFuzzer: deadly signal
 ```
 
-`src/engines/valkey_server.rs:357` の `read_reply` は
-`vec![0u8; length as usize + 2]` を読む前に確保する。同じ形が `src/cache.rs:682` の
-`read_reply_inner` にもある。相手は事業者が設定したストアなので優先度は高くないが、
-ストア側の不具合や侵害でプロセスが落ちる。修正は「告知長を上限（例: 8 MiB）で
-clamp し、超えたらエラーにする」の 2 箇所。どちらもこの変更の対象ファイル外なので、
-harness はこの検出を隠さずに残してある。
+`src/engines/valkey_server.rs` と `src/cache.rs` はどちらも、ヘッダが告知した長さの
+バッファを読む前に確保していた。修正後は共有の `bounded_resp_length`（`src/cache.rs`）が
+解析不能な値・負値・上限超過（64 MiB）を読み込み前にエラーにし、配列の入れ子は
+`MAX_REPLY_DEPTH` で打ち切る。回帰テストは次の 4 本。
+
+```
+$ cargo test --lib -- resp_lengths_are_bounded \
+    an_oversized_bulk_header_fails_the_read \
+    a_deeply_nested_reply_fails \
+    an_oversized_bulk_header_fails_the_search
+```
+
+### 修正後も同じ入力で落ちないことの確認（任意）
+
+```
+$ printf '$999999999999\r\n' > /tmp/oom/seed
+$ ./fuzz/target/debug/resp_reply -runs=1 /tmp/oom   # 落ちずに終わる
+```
+
+fuzz 側のバイナリはパッチ適用前の seed をそのまま再実行できるので、回帰の確認に使える。
 
 ## コーパス
 
