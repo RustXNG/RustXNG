@@ -1149,12 +1149,18 @@ impl Searcher {
         }
         let mut done: Vec<Option<EngineOutcome>> = (0..engines.len()).map(|_| None).collect();
         let mut last_answer: Option<Instant> = None;
+        // Give up on the stragglers only once the search already has enough
+        // results. A category with few engines (science has five) would
+        // otherwise return nothing: the fast engines answer, the grace window
+        // expires, and the slower ones that would have produced the results
+        // are cancelled.
+        let target = self.settings.search.staged_min_results.max(1);
+        let mut collected = 0usize;
         loop {
-            // Once an engine has answered, wait at most `grace` for the next
-            // one. Waiting on the future itself matters: a hung engine never
+            // Waiting on the future itself matters: a hung engine never
             // completes, so checking the window after a completion would block
             // until the search deadline, which is the tail this avoids.
-            let next = match last_answer {
+            let next = match last_answer.filter(|_| collected >= target) {
                 Some(answer) => {
                     let left = grace.saturating_sub(answer.elapsed());
                     if left.is_zero() {
@@ -1172,6 +1178,9 @@ impl Searcher {
             };
             if outcome.elapsed > Duration::ZERO {
                 last_answer = Some(Instant::now());
+            }
+            if let Ok(items) = &outcome.items {
+                collected += items.len();
             }
             start_official(&outcome);
             done[index] = Some(outcome);
@@ -2357,6 +2366,31 @@ mod orchestration_tests {
         );
     }
 
+    /// Below the result target the search keeps waiting: a category with few
+    /// engines must not answer with nothing just because one engine is slow.
+    #[tokio::test]
+    async fn a_slow_engine_is_still_awaited_below_the_result_target() {
+        let mut slow_engine = FakeEngine::build("slow", &["general"], 3, false);
+        // Inside the search deadline but well past the grace window.
+        Arc::get_mut(&mut slow_engine).unwrap().delay = Some(Duration::from_millis(600));
+        let fast = FakeEngine::build("fast", &["general"], 1, false);
+        let mut searcher = searcher(vec![slow_engine, fast]);
+        searcher.settings = Arc::new({
+            let mut settings = (*searcher.settings).clone();
+            settings.search.early_stop_grace = 0.05;
+            settings.search.staged_min_results = 5;
+            settings
+        });
+
+        let request = SearchRequest::new(query("cats", &searcher.registry));
+        let response = searcher.search(request).await;
+
+        assert_eq!(
+            response.results.len(),
+            4,
+            "the slow engine's results are kept: the target was not reached"
+        );
+    }
     /// A straggler must not hold the request open to the deadline: once an
     /// engine has answered, the bounded wait gives the rest only the grace
     /// window and reports the cancelled ones as timeouts.
@@ -2365,11 +2399,13 @@ mod orchestration_tests {
         let mut slow_engine = FakeEngine::build("slow", &["general"], 1, false);
         // Long enough that waiting for it would fail the assertion below.
         Arc::get_mut(&mut slow_engine).unwrap().delay = Some(Duration::from_secs(2));
-        let fast = FakeEngine::build("fast", &["general"], 2, false);
+        // Enough results to satisfy the early-stop target on its own.
+        let fast = FakeEngine::build("fast", &["general"], 12, false);
         let mut searcher = searcher(vec![slow_engine, fast]);
         searcher.settings = Arc::new({
             let mut settings = (*searcher.settings).clone();
             settings.search.early_stop_grace = 0.2;
+            settings.search.staged_min_results = 10;
             settings
         });
 
@@ -2382,7 +2418,7 @@ mod orchestration_tests {
             elapsed < Duration::from_millis(1_200),
             "the slow engine held the search for {elapsed:?}"
         );
-        assert_eq!(response.results.len(), 2, "the fast engine still answers");
+        assert_eq!(response.results.len(), 12, "the fast engine still answers");
         assert!(
             response
                 .unresponsive_engines
