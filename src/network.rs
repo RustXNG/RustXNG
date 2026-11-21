@@ -569,7 +569,7 @@ impl Network {
                 (None, None)
             };
         // Only GET requests are revalidated; POST results are refetched.
-        let revalidation = if request.method == Method::Get {
+        let mut revalidation = if request.method == Method::Get {
             stale.as_ref().and_then(Revalidation::from_stale)
         } else {
             None
@@ -603,6 +603,10 @@ impl Network {
                         // The origin confirms the stale body is unchanged:
                         // extend its TTL and reuse it without a download.
                         if let Some(stale) = stale.take() {
+                            if stale.final_url != response.final_url {
+                                revalidation = None;
+                                continue;
+                            }
                             if let (Some(cache), Some(key)) = (cache, cache_key.as_deref()) {
                                 if tokio::time::timeout_at(deadline, cache.refresh(key))
                                     .await
@@ -1139,6 +1143,86 @@ mod tests {
         fn at(&self, index: usize) -> ConditionalHeaders {
             self.0.lock().unwrap()[index].clone()
         }
+    }
+
+    #[tokio::test]
+    async fn changed_redirect_target_is_refetched_without_stale_validators() {
+        use axum::extract::Path;
+        use axum::response::{IntoResponse, Redirect};
+        use axum::{Router, routing::get};
+        use std::sync::Arc;
+
+        let redirects = Arc::new(AtomicUsize::new(0));
+        let counter = redirects.clone();
+        let observed = Observed::default();
+        let seen = observed.clone();
+        let app = Router::new()
+            .route(
+                "/feed",
+                get(move || {
+                    let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move { Redirect::temporary(if first { "/old" } else { "/new" }) }
+                }),
+            )
+            .route(
+                "/{version}",
+                get(move |Path(version): Path<String>, headers: HeaderMap| {
+                    seen.record(&headers);
+                    async move {
+                        if headers.contains_key("if-none-match")
+                            || headers.contains_key("if-modified-since")
+                        {
+                            axum::http::StatusCode::NOT_MODIFIED.into_response()
+                        } else {
+                            (
+                                [
+                                    ("etag", "\"shared\""),
+                                    ("last-modified", "Thu, 01 Jan 2026 00:00:00 GMT"),
+                                ],
+                                version,
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{base}/feed");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut settings = Settings::defaults();
+        settings.outgoing.retries = 0;
+        let network = Network::from_settings(&settings).unwrap();
+        let cache = Cache::memory(Duration::from_millis(250), 8 * 1024 * 1024);
+        let fetch = || {
+            network.fetch(
+                EngineRequest::get(&url),
+                Duration::from_secs(2),
+                Some(&cache),
+                None,
+            )
+        };
+
+        let first = fetch().await.unwrap();
+        assert_eq!(first.text(), "old");
+        assert_eq!(first.final_url, format!("{base}/old"));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let second = fetch().await.unwrap();
+        assert_eq!(second.text(), "new");
+        assert_eq!(second.final_url, format!("{base}/new"));
+        assert_eq!(observed.at(0), (None, None));
+        assert_eq!(
+            observed.at(1),
+            (
+                Some("\"shared\"".into()),
+                Some("Thu, 01 Jan 2026 00:00:00 GMT".into())
+            )
+        );
+        assert_eq!(observed.at(2), (None, None));
+        assert_eq!(fetch().await.unwrap().text(), "new");
+        assert_eq!(redirects.load(Ordering::SeqCst), 3);
+        server.abort();
     }
 
     #[tokio::test]
