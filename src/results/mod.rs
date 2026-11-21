@@ -309,6 +309,17 @@ impl ResultContainer {
         self.extend_from_page(engine_name, weight, items, 0);
     }
 
+    /// Merge one engine's results where every item carries its own weight.
+    ///
+    /// Weighting a whole source uniformly loses information a source itself
+    /// already ranked by: the local index blends a semantic score into its
+    /// order, and that score has to reach the merged number as well. Weights
+    /// must not increase along the source's own order, or a later hit could
+    /// outrank an earlier one after the position fusion.
+    pub fn extend_weighted(&mut self, engine_name: &str, items: Vec<(f64, EngineItem)>) {
+        self.extend_items(engine_name, items, 0);
+    }
+
     /// Merge one engine's results that came from a deeper result page.
     ///
     /// Deeper pages score lower because their positions are shifted by
@@ -321,13 +332,18 @@ impl ResultContainer {
         items: Vec<EngineItem>,
         page_offset: u32,
     ) {
+        let items = items.into_iter().map(|item| (weight, item)).collect();
+        self.extend_items(engine_name, items, page_offset);
+    }
+
+    fn extend_items(&mut self, engine_name: &str, items: Vec<(f64, EngineItem)>, page_offset: u32) {
         if self.closed {
             return;
         }
         const PAGE_POSITION_STRIDE: u32 = 100;
         let mut position = page_offset.saturating_mul(PAGE_POSITION_STRIDE);
         let deep_page = page_offset;
-        for item in items {
+        for (weight, item) in items {
             match item {
                 EngineItem::Suggestion(suggestion) => {
                     if !suggestion.trim().is_empty() {
@@ -1138,6 +1154,23 @@ mod tests {
         container.close(|_| 1.0, &[], 0.0, "", 0.0);
         assert_eq!(container.ordered()[0].score, 2.0);
         assert_eq!(container.ordered()[1].score, 0.5);
+    }
+
+    #[test]
+    fn per_item_weights_reach_the_merged_score() {
+        let mut container = ResultContainer::new();
+        container.extend_weighted(
+            "local_index",
+            vec![
+                (1.5, result("https://example.com/first", "first")),
+                (1.2, result("https://example.com/second", "second")),
+            ],
+        );
+        container.close(|_| 1.0, &[], 0.0, "", 0.0);
+        let ordered = container.ordered();
+        assert_eq!(ordered[0].url, "https://example.com/first");
+        assert_eq!(ordered[0].score, 1.5);
+        assert_eq!(ordered[1].score, 0.6);
     }
 
     #[test]

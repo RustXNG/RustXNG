@@ -2,6 +2,7 @@
 //! Word tokens support space-separated text; character bigrams support CJK.
 
 mod mixed_script;
+pub mod schedule;
 
 use std::path::Path;
 
