@@ -454,6 +454,13 @@ pub struct Search {
     pub staged_tier: usize,
     /// The staged strategy stops starting new tiers at this many results.
     pub staged_min_results: usize,
+    /// Seconds a parallel search keeps waiting once an engine runs past this
+    /// point without having answered. 0 keeps the old behaviour of waiting
+    /// for every engine up to the search deadline.
+    ///
+    /// One slow provider otherwise holds the whole request open to
+    /// `timeout_limit`, which is where the three-second tail came from.
+    pub early_stop_grace: f64,
     /// How many of the top results get their page text when the request asks
     /// for raw content. Larger means richer answers, slower fetches.
     pub raw_content_limit: usize,
@@ -550,6 +557,12 @@ impl Default for Search {
         // A 429 usually clears in minutes; an hour is far too punishing for
         // a good engine such as Yahoo! JAPAN (upstream defaults to 3600).
         suspended_times.insert("SearxEngineTooManyRequests".into(), 300);
+        // A timeout is cut short by the search deadline and the bounded
+        // parallel wait, so resting is not needed by default: measured with
+        // the grace window in place, resting an engine here only produced
+        // empty result sets without making the request faster. Operators who
+        // want it can set `SearxEngineTimeout`.
+        suspended_times.insert("SearxEngineTimeout".into(), 0);
         suspended_times.insert("cf_SearxEngineCaptcha".into(), 3_600);
         suspended_times.insert("cf_SearxEngineAccessDenied".into(), 3_600);
         suspended_times.insert("recaptcha_SearxEngineCaptcha".into(), 3_600);
@@ -570,6 +583,7 @@ impl Default for Search {
             strategy: SearchStrategy::Parallel,
             staged_tier: 8,
             staged_min_results: 10,
+            early_stop_grace: 0.75,
             raw_content_limit: 5,
             relevance_weight: 4.0,
             embedding_url: String::new(),

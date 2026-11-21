@@ -699,6 +699,12 @@ impl Searcher {
         };
         let main = async {
             match request.strategy {
+                crate::settings::SearchStrategy::Parallel
+                    if self.settings.search.early_stop_grace > 0.0 =>
+                {
+                    self.run_parallel_bounded(&engines, &request, deadline, &start_official)
+                        .await
+                }
                 crate::settings::SearchStrategy::Parallel => {
                     futures::future::join_all(engines.iter().map(|engine| async {
                         let outcome = self.run_engine(engine, &request, deadline).await;
@@ -1110,6 +1116,78 @@ impl Searcher {
             FailureKind::from(&error)
         })?;
         check_quality(engine.name(), &request.query, items)
+    }
+
+    /// Run every engine at once, but stop waiting once the slow ones run past
+    /// the grace window.
+    ///
+    /// A provider that never answers used to hold the whole search open to
+    /// `timeout_limit`; measured on the science category that pinned 40% of
+    /// requests at 3.0 s. Here the fast engines still answer together, and a
+    /// straggler only keeps the request open for `early_stop_grace` seconds
+    /// after the last engine that did answer. Reported outcomes keep their
+    /// registry order and every started engine is accounted for: a cancelled
+    /// one is reported as a timeout, so a smaller result set stays explicable.
+    async fn run_parallel_bounded<F>(
+        &self,
+        engines: &[EngineHandle],
+        request: &SearchRequest,
+        deadline: Instant,
+        start_official: &F,
+    ) -> Vec<EngineOutcome>
+    where
+        F: Fn(&EngineOutcome),
+    {
+        use futures::StreamExt;
+        let grace = Duration::from_secs_f64(self.settings.search.early_stop_grace.max(0.0));
+        let mut futures = futures::stream::FuturesUnordered::new();
+        for (index, engine) in engines.iter().enumerate() {
+            futures.push(async move {
+                let outcome = self.run_engine(engine, request, deadline).await;
+                (index, outcome)
+            });
+        }
+        let mut done: Vec<Option<EngineOutcome>> = (0..engines.len()).map(|_| None).collect();
+        let mut last_answer: Option<Instant> = None;
+        loop {
+            // Once an engine has answered, wait at most `grace` for the next
+            // one. Waiting on the future itself matters: a hung engine never
+            // completes, so checking the window after a completion would block
+            // until the search deadline, which is the tail this avoids.
+            let next = match last_answer {
+                Some(answer) => {
+                    let left = grace.saturating_sub(answer.elapsed());
+                    if left.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(left, futures.next()).await {
+                        Ok(next) => next,
+                        Err(_) => break,
+                    }
+                }
+                None => futures.next().await,
+            };
+            let Some((index, outcome)) = next else {
+                break;
+            };
+            if outcome.elapsed > Duration::ZERO {
+                last_answer = Some(Instant::now());
+            }
+            start_official(&outcome);
+            done[index] = Some(outcome);
+        }
+        done.into_iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                outcome.unwrap_or_else(|| EngineOutcome {
+                    engine: engines[index].name().to_string(),
+                    weight: engines[index].weight(),
+                    items: Err(FailureKind::Timeout),
+                    elapsed: Duration::ZERO,
+                    suspended: false,
+                })
+            })
+            .collect()
     }
 
     /// Start engines tier by tier and stop once enough results were collected.
@@ -1583,6 +1661,8 @@ mod orchestration_tests {
         build_error: bool,
         queries: std::sync::Mutex<Vec<Query>>,
         applicable: Option<ApplicabilityPredicate>,
+        /// How long the fake engine takes, to exercise the bounded wait.
+        delay: Option<Duration>,
     }
 
     impl FakeEngine {
@@ -1613,6 +1693,7 @@ mod orchestration_tests {
                 build_error,
                 queries: std::sync::Mutex::new(Vec::new()),
                 applicable,
+                delay: None,
             })
         }
     }
@@ -1636,6 +1717,9 @@ mod orchestration_tests {
             pageno: u32,
         ) -> Result<Vec<EngineItem>, EngineError> {
             self.build_request(query, pageno)?;
+            if let Some(delay) = self.delay {
+                std::thread::sleep(delay);
+            }
             self.parse(
                 &EngineResponse::new(200, "https://fake.invalid/", Vec::new()),
                 query,
@@ -2273,6 +2357,40 @@ mod orchestration_tests {
         );
     }
 
+    /// A straggler must not hold the request open to the deadline: once an
+    /// engine has answered, the bounded wait gives the rest only the grace
+    /// window and reports the cancelled ones as timeouts.
+    #[tokio::test]
+    async fn a_straggler_does_not_hold_the_search_open() {
+        let mut slow_engine = FakeEngine::build("slow", &["general"], 1, false);
+        // Long enough that waiting for it would fail the assertion below.
+        Arc::get_mut(&mut slow_engine).unwrap().delay = Some(Duration::from_secs(2));
+        let fast = FakeEngine::build("fast", &["general"], 2, false);
+        let mut searcher = searcher(vec![slow_engine, fast]);
+        searcher.settings = Arc::new({
+            let mut settings = (*searcher.settings).clone();
+            settings.search.early_stop_grace = 0.2;
+            settings
+        });
+
+        let request = SearchRequest::new(query("cats", &searcher.registry));
+        let started = Instant::now();
+        let response = searcher.search(request).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(1_200),
+            "the slow engine held the search for {elapsed:?}"
+        );
+        assert_eq!(response.results.len(), 2, "the fast engine still answers");
+        assert!(
+            response
+                .unresponsive_engines
+                .iter()
+                .any(|engine| engine.engine == "slow"),
+            "the cancelled engine is reported, not silently dropped"
+        );
+    }
     #[tokio::test]
     async fn failing_engines_are_reported_as_unresponsive() {
         let searcher = searcher(vec![FakeEngine::build("broken", &["general"], 0, true)]);

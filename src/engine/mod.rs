@@ -204,12 +204,29 @@ impl FailureKind {
     }
 
     /// Suspension key used in the settings.
+    ///
+    /// A timeout is included: an engine that runs into the search deadline
+    /// holds the whole request open, and without a rest it does so on every
+    /// search. One timeout is still tolerated, because a single slow answer
+    /// says nothing about the provider; the second in a row rests it.
     pub fn suspension_key(self) -> Option<&'static str> {
         match self {
             Self::AccessDenied => Some("SearxEngineAccessDenied"),
             Self::Captcha => Some("SearxEngineCaptcha"),
             Self::TooManyRequests => Some("SearxEngineTooManyRequests"),
+            Self::Timeout => Some("SearxEngineTimeout"),
             _ => None,
+        }
+    }
+
+    /// Whether this failure has to repeat before it suspends the engine.
+    ///
+    /// The hard blocks already say the provider will keep refusing; a timeout
+    /// can be one congested answer, so it needs two in a row.
+    pub fn starts_suspension(self, consecutive_failures: u64) -> bool {
+        match self {
+            Self::Timeout => consecutive_failures >= 2,
+            _ => self.suspension_key().is_some(),
         }
     }
 }

@@ -162,6 +162,7 @@ impl EngineStates {
             state.consecutive_failures += 1;
 
             let suspension = match kind.suspension_key() {
+                Some(_) if !kind.starts_suspension(state.consecutive_failures) => 0,
                 Some(key) => {
                     let configured = settings.suspended_times.get(key).copied().unwrap_or(3_600);
                     // The configured window overrides the first step and stays
@@ -256,6 +257,51 @@ mod tests {
         let seconds = states.record_failure("duckduckgo", FailureKind::AccessDenied, &settings);
         assert_eq!(seconds, 3_600);
         assert!(states.suspension("duckduckgo").is_some());
+    }
+
+    #[test]
+    fn timeouts_do_not_rest_an_engine_by_default() {
+        let states = EngineStates::new();
+        let settings = Search::default();
+
+        // The bounded parallel wait cuts a slow engine short, so resting it
+        // would only remove results. Repeated timeouts stay unsuspended.
+        for _ in 0..3 {
+            let seconds = states.record_failure("slow", FailureKind::Timeout, &settings);
+            assert_eq!(seconds, 0);
+            assert!(states.suspension("slow").is_none());
+        }
+    }
+
+    #[test]
+    fn a_configured_timeout_window_rests_the_engine_after_two_failures() {
+        let states = EngineStates::new();
+        let mut settings = Search::default();
+        settings
+            .suspended_times
+            .insert("SearxEngineTimeout".into(), 60);
+
+        // One congested answer says nothing about the provider.
+        let first = states.record_failure("slow", FailureKind::Timeout, &settings);
+        assert_eq!(first, 0);
+        assert!(states.suspension("slow").is_none());
+
+        let second = states.record_failure("slow", FailureKind::Timeout, &settings);
+        assert_eq!(second, 60);
+        assert!(states.suspension("slow").is_some());
+    }
+
+    #[test]
+    fn a_success_between_timeouts_clears_the_streak() {
+        let states = EngineStates::new();
+        let settings = Search::default();
+        states.record_failure("slow", FailureKind::Timeout, &settings);
+        states.record_success("slow", 3, Duration::from_millis(90), &settings);
+
+        // The next timeout is the first of a new streak again.
+        let again = states.record_failure("slow", FailureKind::Timeout, &settings);
+        assert_eq!(again, 0);
+        assert!(states.suspension("slow").is_none());
     }
 
     #[test]

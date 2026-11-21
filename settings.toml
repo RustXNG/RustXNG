@@ -67,6 +67,10 @@ formats = ["html", "csv", "json", "rss"]
 strategy = "parallel"
 staged_tier = 8
 staged_min_results = 10
+# parallel 検索で、最初のエンジンが応答したあと次の応答を待つ猶予（秒）。
+# 応答しないエンジンが検索全体を timeout_limit まで引き延ばすのを防ぐ。
+# 0 で従来どおり全エンジンの完了を待つ。
+early_stop_grace = 0.75
 # include_raw_content=1 のとき上位何件まで本文を取得するか（多いほど豊か・遅い）。
 raw_content_limit = 5
 # 本文の文字数上限。8,000文字を超える指定も可能。
@@ -115,6 +119,10 @@ embedding_topk = 25
 SearxEngineAccessDenied = 3600
 SearxEngineCaptcha = 3600
 SearxEngineTooManyRequests = 300
+# 連続 2 回タイムアウトしたエンジンを休ませる秒数。既定 0（無効）。
+# 遅いエンジンは early_stop_grace で打ち切るため、休止は必須ではない。
+# 有効にすると結果が減ることがある（実測で空結果が出た）。
+SearxEngineTimeout = 0
 cf_SearxEngineCaptcha = 3600
 cf_SearxEngineAccessDenied = 3600
 recaptcha_SearxEngineCaptcha = 3600
